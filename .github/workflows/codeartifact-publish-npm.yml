@@ -271,9 +271,12 @@ jobs:
           fi
           # Publishing a private package to the public registry is not recoverable, so
           # assert the resolved target is CodeArtifact before uploading anything.
-          TARGET=$(npm config get registry)
+          # --workspaces=false: inside a workspaces monorepo npm treats the package
+          # directory as an implicit workspace and refuses npm config with ENOWORKSPACES;
+          # the flag turns that detection off and reads the user config as intended.
+          TARGET=$(npm config get registry --workspaces=false)
           if [ -n "$PACKAGE_NAMESPACE" ]; then
-            TARGET=$(npm config get "@${PACKAGE_NAMESPACE}:registry")
+            TARGET=$(npm config get "@${PACKAGE_NAMESPACE}:registry" --workspaces=false)
           fi
           case "$TARGET" in
             *.codeartifact.*|*.on.aws/*)
