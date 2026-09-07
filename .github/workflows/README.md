@@ -57,6 +57,9 @@ Outputs: none.
 ```yaml
 jobs:
   backend-ci:
+    permissions:
+      contents: read
+      id-token: write
     uses: WebbPulse/.github/.github/workflows/python-ci.yml@v1
     with:
       working-directory: backend
@@ -100,6 +103,9 @@ Outputs: none.
 ```yaml
 jobs:
   frontend-ci:
+    permissions:
+      contents: read
+      id-token: write
     uses: WebbPulse/.github/.github/workflows/typescript-ci.yml@v1
     with:
       working-directory: frontend
@@ -150,6 +156,9 @@ build fails here rather than at deploy time.
 ```yaml
 jobs:
   image:
+    permissions:
+      contents: read
+      id-token: write
     uses: WebbPulse/.github/.github/workflows/container-image.yml@v1
     with:
       ecr-repository: ${{ vars.ECR_REPOSITORY }}
@@ -208,6 +217,9 @@ Outputs: none.
 jobs:
   deploy:
     needs: image
+    permissions:
+      contents: read
+      id-token: write
     uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v1
     with:
       aws-region: ${{ vars.AWS_REGION }}
@@ -275,6 +287,9 @@ Outputs: none.
 ```yaml
 jobs:
   deploy-frontend:
+    permissions:
+      contents: read
+      id-token: write
     uses: WebbPulse/.github/.github/workflows/spa-deploy.yml@v1
     with:
       environment: production
@@ -330,6 +345,9 @@ Shared inputs: `working-directory`, `codeartifact-domain` (required),
 ```yaml
 jobs:
   publish:
+    permissions:
+      contents: read
+      id-token: write
     uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v1
     with:
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
@@ -345,6 +363,9 @@ The npm workflow is called the same way:
 ```yaml
 jobs:
   publish:
+    permissions:
+      contents: read
+      id-token: write
     uses: WebbPulse/.github/.github/workflows/codeartifact-publish-npm.yml@v1
     with:
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
@@ -396,6 +417,8 @@ on:
 
 jobs:
   terraform-checks:
+    permissions:
+      contents: read
     uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@v1
     with:
       working-directory: terraform
@@ -466,8 +489,29 @@ What a caller repository has to provide before these workflows will run.
 Each role trusts `token.actions.githubusercontent.com`, with `sub` scoped to the
 calling repository and ideally to the environment, and audience `sts.amazonaws.com`.
 Roles are assumed by `aws-actions/configure-aws-credentials`, which needs
-`id-token: write` on the calling job. Callers do not set that permission themselves:
-each reusable workflow requests it on its own jobs, and only where OIDC is used.
+`id-token: write` on the job. **Every job that calls one of these workflows must
+grant `contents: read` and `id-token: write` on the calling job itself:**
+
+```yaml
+jobs:
+  backend-ci:
+    permissions:
+      contents: read
+      id-token: write
+```
+
+A called workflow can only hold permissions equal to or narrower than the grant on
+the job that calls it. The reusable workflows do request `id-token: write` on their
+own jobs, but that request cannot widen what the caller gave them: a caller job
+running under a top level `permissions: contents: read` hands down a token with
+`id-token: none`, and the run fails at startup before any step executes, with an
+error naming the requested permission rather than the missing credential. This is
+what broke the first CI run of `webbpulse-python`.
+
+Setting the permissions at the top level of the caller does not work on its own
+either. A job that declares its own `permissions:` block replaces the top level
+grant rather than merging with it, so the block above belongs on each calling job.
+`terraform-speculative-plan.yml` uses no OIDC and needs only `contents: read`.
 
 **IAM permissions, per workflow**
 
