@@ -200,6 +200,11 @@ jobs:
 
       - name: Log in to CodeArtifact for npm
         if: steps.exists.outputs.exists != 'true'
+        # Run from outside the checkout. login --tool npm shells out to npm config set,
+        # which npm refuses with ENOWORKSPACES when the current directory is a package
+        # inside a workspaces monorepo. The settings land in ~/.npmrc (user location)
+        # whatever the working directory is, so the publish step still picks them up.
+        working-directory: ${{ runner.temp }}
         env:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
