@@ -1,0 +1,174 @@
+# Reusable Python CI for WebbPulse backend services.
+#
+# Nothing in this file is estate specific. Every account id, ARN, domain owner and
+# repository name arrives from the calling repository as an input or a secret.
+name: Python CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version to set up."
+        type: string
+        required: false
+        default: "3.13"
+      working-directory:
+        description: "Directory holding the Python project (pyproject.toml, requirements files)."
+        type: string
+        required: false
+        default: "backend"
+      install-command:
+        description: "Command used to install dependencies, run inside working-directory."
+        type: string
+        required: false
+        default: "python -m pip install --upgrade pip && pip install -r requirements-dev.txt"
+      ruff-target:
+        description: "Paths passed to ruff check and ruff format."
+        type: string
+        required: false
+        default: "."
+      pytest-args:
+        description: "Extra arguments appended to the pytest invocation."
+        type: string
+        required: false
+        default: ""
+      coverage-source:
+        description: "Package or directory measured by coverage."
+        type: string
+        required: false
+        default: "app"
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+      codeartifact-domain:
+        description: "CodeArtifact domain. Leave empty to skip the CodeArtifact login step."
+        type: string
+        required: false
+        default: ""
+      codeartifact-repository:
+        description: "CodeArtifact repository name. Required when codeartifact-domain is set."
+        type: string
+        required: false
+        default: ""
+      aws-region:
+        description: "AWS region for the CodeArtifact login."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC to read from CodeArtifact."
+        required: false
+      codeartifact-domain-owner:
+        description: "AWS account id that owns the CodeArtifact domain."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  python-ci:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      # Needed only for the optional CodeArtifact login. Harmless when unused.
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this workflow uses the checkout token afterwards, so the
+          # credentials are not left behind in .git/config for later steps to reuse.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      # CodeArtifact hosts the shared WebbPulse Python packages. GetAuthorizationToken
+      # needs both codeartifact:GetAuthorizationToken and sts:GetServiceBearerToken on
+      # the assumed role. The login writes an index-url into pip.conf, so it has to run
+      # before the install step.
+      # aws-region is a required input on configure-aws-credentials, and
+      # codeartifact-repository is required by the login below, so fail with a clear
+      # message here rather than an opaque action error further down.
+      - name: Validate the CodeArtifact inputs
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          AWS_REGION_INPUT: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -n "$CODEARTIFACT_REPOSITORY" ] || MISSING="$MISSING codeartifact-repository"
+          [ -n "$AWS_REGION_INPUT" ] || MISSING="$MISSING aws-region"
+          if [ -n "$MISSING" ]; then
+            echo "codeartifact-domain is set, so these inputs are required too:$MISSING"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials for CodeArtifact
+        if: inputs.codeartifact-domain != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to CodeArtifact for pip
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          aws codeartifact login \
+            --tool pip \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Ruff check
+        run: ruff check --output-format=github ${{ inputs.ruff-target }}
+
+      - name: Ruff format check
+        run: ruff format --check --diff ${{ inputs.ruff-target }}
+
+      - name: Pytest with coverage
+        run: |
+          python -m pytest \
+            --cov=${{ inputs.coverage-source }} \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --junitxml=pytest-report.xml \
+            ${{ inputs.pytest-args }}
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ ! -f coverage.xml ]; then
+            echo "No coverage.xml produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("coverage.xml").getroot()
+          line_rate = float(root.get("line_rate", 0)) * 100
+          branch_rate = float(root.get("branch_rate", 0)) * 100
+          print("## Python coverage")
+          print()
+          print("| Metric | Value |")
+          print("| --- | --- |")
+          print(f"| Line coverage | {line_rate:.2f}% |")
+          print(f"| Branch coverage | {branch_rate:.2f}% |")
+          PY

@@ -1,0 +1,185 @@
+# Reusable container image build and push for WebbPulse Lambda domain images.
+#
+# One image per domain, built from a Dockerfile, pushed to a per domain ECR
+# repository in the calling application's account with the immutable tag
+# sha-<full git sha>. The digest and the full image URI are returned as workflow
+# outputs so a downstream deploy job can pin the function to the exact digest.
+#
+# Nothing in this file is estate specific. The registry, repository and role ARN
+# arrive from the calling repository as inputs or secrets.
+name: Container Image
+
+on:
+  workflow_call:
+    inputs:
+      ecr-repository:
+        description: "ECR repository name, without the registry host."
+        type: string
+        required: true
+      aws-region:
+        description: "AWS region holding the ECR repository."
+        type: string
+        required: true
+      context:
+        description: "Docker build context."
+        type: string
+        required: false
+        default: "."
+      dockerfile:
+        description: "Path to the Dockerfile, relative to the workspace."
+        type: string
+        required: false
+        default: "Dockerfile"
+      platform:
+        description: "Single target platform. Lambda rejects multi architecture images, so pass exactly one."
+        type: string
+        required: false
+        default: "linux/arm64"
+      build-args:
+        description: "Newline separated build arguments passed to docker build."
+        type: string
+        required: false
+        default: ""
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC, allowed to push to the ECR repository."
+        required: true
+    outputs:
+      image-digest:
+        description: "The pushed image digest, for example sha256:abcd..."
+        value: ${{ jobs.build.outputs.image-digest }}
+      image-uri:
+        description: "Full image URI pinned by digest, registry/repository@sha256:..."
+        value: ${{ jobs.build.outputs.image-uri }}
+      image-tag:
+        description: "The immutable tag applied to the image, sha-<full git sha>."
+        value: ${{ jobs.build.outputs.image-tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-uri: ${{ steps.uri.outputs.image-uri }}
+      image-tag: ${{ steps.tag.outputs.image-tag }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this workflow uses the checkout token afterwards, so the
+          # credentials are not left behind in .git/config for later steps to reuse.
+          persist-credentials: false
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Compute the immutable tag
+        id: tag
+        run: echo "image-tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # provenance and SBOM attestations are disabled deliberately. When buildx
+      # attaches them it publishes an OCI image index (a manifest list) rather than
+      # a single image manifest. The Lambda documentation states, under the container
+      # image requirements, that "Lambda provides multi-architecture base images.
+      # However, the image you build for your function must target only one of the
+      # architectures. Lambda does not support functions that use multi-architecture
+      # container images." A function pointed at an index fails to create or update.
+      # Lambda accepts Docker image manifest V2 schema 2 and OCI image specification
+      # v1.0.0 and up, which is what a single platform build without attestations
+      # produces. See
+      # https://docs.aws.amazon.com/lambda/latest/dg/images-create.html
+      - name: Build and push the image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platform }}
+          push: true
+          provenance: false
+          sbom: false
+          build-args: ${{ inputs.build-args }}
+          tags: ${{ steps.ecr-login.outputs.registry }}/${{ inputs.ecr-repository }}:${{ steps.tag.outputs.image-tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish the image URI
+        id: uri
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: ${{ inputs.ecr-repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if [ -z "$DIGEST" ]; then
+            echo "The build produced no digest."
+            exit 1
+          fi
+          IMAGE_URI="${REGISTRY}/${REPOSITORY}@${DIGEST}"
+          echo "image-uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Container image"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Repository | \`${REPOSITORY}\` |"
+            echo "| Tag | \`sha-${GITHUB_SHA}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A single platform build must resolve to an image manifest, never an index.
+      # This check fails loudly here rather than at update-function-code time.
+      - name: Verify the manifest is single platform
+        env:
+          REPOSITORY: ${{ inputs.ecr-repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          MEDIA_TYPE=$(aws ecr batch-get-image \
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageDigest=$DIGEST" \
+            --query 'images[0].imageManifestMediaType' \
+            --output text)
+          echo "Manifest media type: $MEDIA_TYPE"
+
+          # An assertion that cannot read the media type must fail, not pass. The CLI
+          # prints None for a missing field, and batch-get-image reports an unknown
+          # digest in failures[] while still exiting 0, so both cases land here.
+          if [ -z "$MEDIA_TYPE" ] || [ "$MEDIA_TYPE" = "None" ]; then
+            echo "Could not read the manifest media type for $DIGEST."
+            exit 1
+          fi
+
+          case "$MEDIA_TYPE" in
+            application/vnd.docker.distribution.manifest.list.v2+json | application/vnd.oci.image.index.v1+json)
+              echo "The image is a multi architecture index. Lambda does not support this."
+              exit 1
+              ;;
+            application/vnd.docker.distribution.manifest.v2+json | application/vnd.oci.image.manifest.v1+json)
+              echo "Single platform image manifest. Lambda accepts this."
+              ;;
+            *)
+              echo "Unrecognised manifest media type $MEDIA_TYPE. Refusing to deploy it."
+              exit 1
+              ;;
+          esac

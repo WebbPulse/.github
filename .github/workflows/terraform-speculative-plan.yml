@@ -1,0 +1,79 @@
+# Reusable Terraform static checks for a pull request touching terraform/**.
+#
+# This deliberately runs fmt and validate only. HCP Terraform already runs the
+# speculative plan for the pull request and posts its own status, so this workflow
+# posts no comment and produces no plan of its own. It exists to fail fast on
+# formatting and configuration errors before HCP picks the run up.
+#
+# Nothing in this file is estate specific. The workspace lives in HCP and is named
+# by the cloud block inside the caller's Terraform configuration.
+name: Terraform Speculative Plan Checks
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory holding the root Terraform configuration."
+        type: string
+        required: false
+        default: "terraform"
+      terraform-version:
+        description: "Terraform CLI version."
+        type: string
+        required: false
+        default: "1.13.1"
+      fmt-recursive:
+        description: "Run terraform fmt -check recursively over the working directory."
+        type: boolean
+        required: false
+        default: true
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    secrets:
+      tf-api-token:
+        description: "HCP Terraform API token, exported as TF_TOKEN_app_terraform_io for terraform init."
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      # terraform init needs to reach the HCP workspace named in the cloud block to
+      # resolve the backend before validate can run.
+      TF_TOKEN_app_terraform_io: ${{ secrets.tf-api-token }}
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this workflow uses the checkout token afterwards, so the
+          # credentials are not left behind in .git/config for later steps to reuse.
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          # The wrapper rewrites stdout to add step outputs, which is not needed here
+          # and makes the raw fmt diff harder to read.
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -diff ${{ inputs.fmt-recursive && '-recursive' || '' }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
