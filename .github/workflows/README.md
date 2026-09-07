@@ -219,6 +219,7 @@ a single directory, and assembles the `function-image-map` that
 | `skip-if-tag-exists` | boolean | `true` | Skip the build when the tag already resolves, and emit the existing digest. |
 | `upload-manifest-artifact` | boolean | `false` | Upload the per leg JSON manifest. |
 | `artifact-name` | string | `""` | Overrides the default `image-<sanitised repository>-<tag>`. |
+| `environment` | string | `""` | GitHub Environment the build job binds to. Set it here rather than on the caller job: GitHub rejects a job that both `uses:` a reusable workflow and declares `environment:`. |
 | `runs-on` | string | `ubuntu-latest` | |
 
 | Secret | Required | Notes |
@@ -252,11 +253,27 @@ jobs:
 
 Four domain images from one Dockerfile, with the CodeArtifact token, a base image
 pulled from the Artifacts account, and the per leg manifests collected into a
-`function-image-map`:
+`function-image-map`. The deploy role ARN lives in an environment variable, and a
+job that `uses:` a reusable workflow can neither declare `environment:` nor read
+environment scoped `vars`, so a small `resolve-env` job binds to the environment,
+exports the ARN, and the build legs pass the environment name through the
+`environment` input instead:
 
 ```yaml
 jobs:
+  resolve-env:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+      role-arn: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+    steps:
+      - run: 'true'
+
   build-images:
+    needs: resolve-env
     strategy:
       fail-fast: false
       matrix:
@@ -264,10 +281,10 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
     uses: WebbPulse/.github/.github/workflows/container-image.yml@v1
     with:
-      ecr-repository: webbpulse-${{ github.ref_name == 'main' && 'production' || 'staging' }}/${{ matrix.domain }}
+      environment: ${{ needs.resolve-env.outputs.name }}
+      ecr-repository: webbpulse-${{ needs.resolve-env.outputs.name }}/${{ matrix.domain }}
       aws-region: us-west-2
       context: backend
       dockerfile: backend/Dockerfile
@@ -283,7 +300,7 @@ jobs:
       additional-ecr-registries: "432410731887"
       upload-manifest-artifact: true
     secrets:
-      role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
 
   image-map:
     needs: build-images
