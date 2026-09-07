@@ -40,6 +40,65 @@ on:
         type: string
         required: false
         default: ""
+      codeartifact-domain:
+        description: >-
+          CodeArtifact domain. Leave empty to skip minting a CodeArtifact token.
+          When set, a token is minted after the AWS credentials step and handed to
+          the build as a BuildKit secret, never as a build argument.
+        type: string
+        required: false
+        default: ""
+      codeartifact-domain-owner:
+        description: "AWS account id that owns the CodeArtifact domain. Required when codeartifact-domain is set."
+        type: string
+        required: false
+        default: ""
+      codeartifact-repository:
+        description: "CodeArtifact repository name. Required when codeartifact-domain is set."
+        type: string
+        required: false
+        default: ""
+      codeartifact-secret-id:
+        description: >-
+          BuildKit secret id the Dockerfile mounts the CodeArtifact token from, as in
+          RUN --mount=type=secret,id=codeartifact_token.
+        type: string
+        required: false
+        default: "codeartifact_token"
+      additional-ecr-registries:
+        description: >-
+          Comma or newline separated AWS account ids of further ECR registries to log
+          in to, so a FROM can pull a base image out of another account. The caller's
+          own account is always included and does not need naming here. The push still
+          goes to the caller's own registry.
+        type: string
+        required: false
+        default: ""
+      skip-if-tag-exists:
+        description: >-
+          Skip the build when the target tag already resolves in the repository, and
+          emit the existing digest as the outputs. ECR repositories in this estate use
+          IMMUTABLE tags, so a rerun of a green commit would otherwise push a tag that
+          already exists.
+        type: boolean
+        required: false
+        default: true
+      upload-manifest-artifact:
+        description: >-
+          Upload a small JSON artifact naming the repository, tag, digest and digest
+          pinned image URI. Reusable workflow outputs collapse across a matrix in the
+          caller, so this is how a fan out job reads every leg's digest back.
+        type: boolean
+        required: false
+        default: false
+      artifact-name:
+        description: >-
+          Name of the manifest artifact. Defaults to image-<sanitised repository>-<tag>,
+          which is unique per matrix leg and matches the pattern image-* for
+          download-artifact with merge-multiple.
+        type: string
+        required: false
+        default: ""
       runs-on:
         description: "Runner label."
         type: string
@@ -59,6 +118,9 @@ on:
       image-tag:
         description: "The immutable tag applied to the image, sha-<full git sha>."
         value: ${{ jobs.build.outputs.image-tag }}
+      image-existed:
+        description: "true when the tag already resolved and the build was skipped."
+        value: ${{ jobs.build.outputs.image-existed }}
 
 permissions:
   contents: read
@@ -70,9 +132,13 @@ jobs:
       id-token: write
       contents: read
     outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
+      image-digest: ${{ steps.uri.outputs.image-digest }}
       image-uri: ${{ steps.uri.outputs.image-uri }}
       image-tag: ${{ steps.tag.outputs.image-tag }}
+      # The step is skipped entirely when skip-if-tag-exists is false, and a skipped
+      # step's output is the empty string rather than false, so normalise it here and
+      # keep the output a boolean string in every case.
+      image-existed: ${{ steps.existing.outputs.exists == 'true' }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,22 +147,150 @@ jobs:
           # credentials are not left behind in .git/config for later steps to reuse.
           persist-credentials: false
 
+      # codeartifact-domain-owner and codeartifact-repository are both required by
+      # get-authorization-token, so fail with a clear message here rather than an
+      # opaque CLI error further down. Mirrors the same guard in python-ci.yml.
+      - name: Validate the CodeArtifact inputs
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN_OWNER: ${{ inputs.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_SECRET_ID: ${{ inputs.codeartifact-secret-id }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -n "$CODEARTIFACT_DOMAIN_OWNER" ] || MISSING="$MISSING codeartifact-domain-owner"
+          [ -n "$CODEARTIFACT_REPOSITORY" ] || MISSING="$MISSING codeartifact-repository"
+          [ -n "$CODEARTIFACT_SECRET_ID" ] || MISSING="$MISSING codeartifact-secret-id"
+          if [ -n "$MISSING" ]; then
+            echo "codeartifact-domain is set, so these inputs are required too:$MISSING"
+            exit 1
+          fi
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
+      # The caller's own registry host, resolved from the assumed identity rather
+      # than read from the ECR login output. amazon-ecr-login sets its registry
+      # output only when it logs in to exactly one registry, and it logs in to more
+      # than one as soon as additional-ecr-registries is passed. Deriving the host
+      # here keeps the tag, the image URI and the existing tag check identical
+      # whether or not a second registry is in play.
+      - name: Resolve this account's registry
+        id: registry
+        env:
+          AWS_REGION_INPUT: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then
+            echo "Could not resolve the account id of the assumed role."
+            exit 1
+          fi
+          echo "account-id=${ACCOUNT_ID}" >> "$GITHUB_OUTPUT"
+          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_INPUT}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      # amazon-ecr-login takes a comma delimited list, and passing one at all means
+      # the default registry is no longer implied, so the caller's own account has to
+      # appear in the list. Newlines are accepted here purely so a caller can write
+      # the list as a YAML block the way build-args is written.
+      - name: Assemble the ECR registry list
+        id: registries
+        env:
+          ACCOUNT_ID: ${{ steps.registry.outputs.account-id }}
+          ADDITIONAL: ${{ inputs.additional-ecr-registries }}
+        run: |
+          set -euo pipefail
+          # tr on ',' first so a comma separated list becomes one id per line, then
+          # strip the blank and quote characters a YAML block might leave around each
+          # id. The newline is preserved deliberately: deleting it here would join
+          # every id into one unparseable run of digits.
+          LIST=$(printf '%s\n%s\n' "$ACCOUNT_ID" "$ADDITIONAL" \
+            | tr ',' '\n' \
+            | tr -d '[:blank:]\r"' \
+            | grep -E '^[0-9]{12}$' \
+            | awk '!seen[$0]++' \
+            | paste -sd ',' - || true)
+          if [ -z "$LIST" ]; then
+            echo "No valid twelve digit account id resolved for the ECR login."
+            exit 1
+          fi
+          echo "Logging in to ECR registries: $LIST"
+          echo "registries=${LIST}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        with:
+          registries: ${{ steps.registries.outputs.registries }}
 
       - name: Compute the immutable tag
         id: tag
         run: echo "image-tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
+      # batch-get-image rather than describe-images on purpose. A consumer deploy role
+      # holds ecr:BatchGetImage on its own domain repositories but ecr:DescribeImages
+      # only on the shared base image repository, so describe-images would fail with a
+      # denial on exactly the repositories this needs to read. batch-get-image reports
+      # an unknown tag in failures[] and still exits 0, so a missing tag is an empty
+      # digest here rather than a non zero exit.
+      - name: Check whether the tag already exists
+        id: existing
+        if: inputs.skip-if-tag-exists
+        env:
+          REPOSITORY: ${{ inputs.ecr-repository }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          DIGEST=$(aws ecr batch-get-image \
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --query 'images[0].imageId.imageDigest' \
+            --output text 2>/dev/null || true)
+          if [ -n "$DIGEST" ] && [ "$DIGEST" != "None" ]; then
+            echo "Tag $IMAGE_TAG already resolves to $DIGEST. Skipping the build."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $IMAGE_TAG does not resolve yet. Building."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Docker Buildx
+        if: steps.existing.outputs.exists != 'true'
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # The CodeArtifact token, minted after the credentials step so the assumed role
+      # is the one that owns the grant. It is exported to the job environment and
+      # handed to the build as a BuildKit secret, never as a build argument: a build
+      # arg is recorded in docker history and readable by anyone who can pull the
+      # image, which is the whole reason the Dockerfile takes a secret mount.
+      #
+      # GetAuthorizationToken needs both codeartifact:GetAuthorizationToken and
+      # sts:GetServiceBearerToken conditioned on
+      # sts:AWSServiceName = codeartifact.amazonaws.com on the assumed role. Without
+      # the second the call fails with a denial that names no CodeArtifact action.
+      - name: Mint a CodeArtifact token
+        if: inputs.codeartifact-domain != '' && steps.existing.outputs.exists != 'true'
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ inputs.codeartifact-domain-owner }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --query authorizationToken \
+            --output text)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "None" ]; then
+            echo "CodeArtifact returned no authorization token."
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "CODEARTIFACT_AUTH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       # provenance and SBOM attestations are disabled deliberately. When buildx
       # attaches them it publishes an OCI image index (a manifest list) rather than
@@ -111,6 +305,7 @@ jobs:
       # https://docs.aws.amazon.com/lambda/latest/dg/images-create.html
       - name: Build and push the image
         id: build
+        if: steps.existing.outputs.exists != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ${{ inputs.context }}
@@ -120,22 +315,38 @@ jobs:
           provenance: false
           sbom: false
           build-args: ${{ inputs.build-args }}
-          tags: ${{ steps.ecr-login.outputs.registry }}/${{ inputs.ecr-repository }}:${{ steps.tag.outputs.image-tag }}
+          # secret-envs names an environment variable to read, so the token never
+          # appears in the workflow file, in docker history or in the build log.
+          # Empty when no CodeArtifact domain was given, which buildx ignores.
+          secret-envs: ${{ inputs.codeartifact-domain != '' && format('{0}=CODEARTIFACT_AUTH_TOKEN', inputs.codeartifact-secret-id) || '' }}
+          tags: ${{ steps.registry.outputs.registry }}/${{ inputs.ecr-repository }}:${{ steps.tag.outputs.image-tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Publish the image URI
         id: uri
         env:
-          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REGISTRY: ${{ steps.registry.outputs.registry }}
           REPOSITORY: ${{ inputs.ecr-repository }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image-tag }}
+          EXISTED: ${{ steps.existing.outputs.exists }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
         run: |
+          set -euo pipefail
+          if [ "$EXISTED" = "true" ]; then
+            DIGEST="$EXISTING_DIGEST"
+            SOURCE="already present, build skipped"
+          else
+            DIGEST="$BUILD_DIGEST"
+            SOURCE="built and pushed"
+          fi
           if [ -z "$DIGEST" ]; then
-            echo "The build produced no digest."
+            echo "No digest resolved for ${REPOSITORY}:${IMAGE_TAG}."
             exit 1
           fi
           IMAGE_URI="${REGISTRY}/${REPOSITORY}@${DIGEST}"
+          echo "image-digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "image-uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           {
             echo "## Container image"
@@ -143,8 +354,9 @@ jobs:
             echo "| Field | Value |"
             echo "| --- | --- |"
             echo "| Repository | \`${REPOSITORY}\` |"
-            echo "| Tag | \`sha-${GITHUB_SHA}\` |"
+            echo "| Tag | \`${IMAGE_TAG}\` |"
             echo "| Digest | \`${DIGEST}\` |"
+            echo "| Status | ${SOURCE} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # A single platform build must resolve to an image manifest, never an index.
@@ -152,7 +364,7 @@ jobs:
       - name: Verify the manifest is single platform
         env:
           REPOSITORY: ${{ inputs.ecr-repository }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.uri.outputs.image-digest }}
         run: |
           set -euo pipefail
           MEDIA_TYPE=$(aws ecr batch-get-image \
@@ -183,3 +395,69 @@ jobs:
               exit 1
               ;;
           esac
+
+      # A matrix of reusable workflow calls collapses to one needs entry in the
+      # caller, whose outputs hold whichever leg finished last, and a job with uses:
+      # cannot carry steps: to capture them itself. Writing each leg to its own
+      # artifact is the way a downstream job reads all of them: download-artifact
+      # with pattern image-* and merge-multiple: true lands one JSON file per leg in
+      # a single directory.
+      - name: Write the image manifest
+        id: manifest
+        if: inputs.upload-manifest-artifact
+        env:
+          REGISTRY: ${{ steps.registry.outputs.registry }}
+          REPOSITORY: ${{ inputs.ecr-repository }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image-tag }}
+          DIGEST: ${{ steps.uri.outputs.image-digest }}
+          IMAGE_URI: ${{ steps.uri.outputs.image-uri }}
+          ARTIFACT_NAME_INPUT: ${{ inputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          MANIFEST_DIR="${RUNNER_TEMP}/container-image-manifest"
+          mkdir -p "$MANIFEST_DIR"
+
+          # Slashes and any other character an artifact name rejects become hyphens,
+          # so webbpulse-staging/content becomes webbpulse-staging-content.
+          SANITISED=$(printf '%s' "$REPOSITORY" | tr -c '[:alnum:]._-' '-')
+          if [ -n "$ARTIFACT_NAME_INPUT" ]; then
+            ARTIFACT_NAME="$ARTIFACT_NAME_INPUT"
+          else
+            ARTIFACT_NAME="image-${SANITISED}-${IMAGE_TAG}"
+          fi
+
+          # One file per leg, named after the artifact, so merge-multiple lands all of
+          # them in one directory without collisions.
+          MANIFEST_PATH="${MANIFEST_DIR}/${ARTIFACT_NAME}.json"
+          python3 - <<'PY' > "$MANIFEST_PATH"
+          import json
+          import os
+
+          print(
+              json.dumps(
+                  {
+                      "repository": os.environ["REPOSITORY"],
+                      "tag": os.environ["IMAGE_TAG"],
+                      "digest": os.environ["DIGEST"],
+                      "image_uri": os.environ["IMAGE_URI"],
+                  },
+                  indent=2,
+              )
+          )
+          PY
+          cat "$MANIFEST_PATH"
+          echo "artifact-name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "manifest-path=${MANIFEST_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the image manifest
+        if: inputs.upload-manifest-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.manifest.outputs.artifact-name }}
+          path: ${{ steps.manifest.outputs.manifest-path }}
+          if-no-files-found: error
+          retention-days: 7
+          # A rerun of the same commit writes the same artifact name, and without
+          # this the upload fails on the name already existing rather than on
+          # anything to do with the image.
+          overwrite: true
