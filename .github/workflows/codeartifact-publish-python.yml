@@ -137,16 +137,27 @@ jobs:
         run: |
           # describe-package-version returns ResourceNotFoundException for an unknown
           # package or version, which is the normal first publish path.
-          if aws codeartifact describe-package-version \
+          # Only ResourceNotFoundException means "not published yet". Any other failure
+          # (denied, throttled, wrong repository) must stop the job rather than be read as
+          # "absent" and turned into a doomed publish attempt.
+          set +e
+          ERR=$(aws codeartifact describe-package-version \
               --domain "$CODEARTIFACT_DOMAIN" \
               --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
               --repository "$CODEARTIFACT_REPOSITORY" \
               --format pypi \
               --package "$PACKAGE_NAME" \
-              --package-version "$PACKAGE_VERSION" >/dev/null 2>&1; then
+              --package-version "$PACKAGE_VERSION" 2>&1 >/dev/null)
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
+          elif echo "$ERR" | grep -q "ResourceNotFoundException"; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=Version lookup failed::describe-package-version failed for ${PACKAGE_NAME}==${PACKAGE_VERSION}"
+            echo "$ERR"
+            exit 1
           fi
 
       - name: Skip the publish
