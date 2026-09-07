@@ -120,7 +120,10 @@ jobs:
 
 Builds one domain image with buildx for a single platform, logs in to ECR through
 OIDC, pushes the immutable tag `sha-<full git sha>`, and returns the digest and the
-digest pinned image URI so a deploy job can pin the exact artifact.
+digest pinned image URI so a deploy job can pin the exact artifact. Optionally mints
+a CodeArtifact token for the build, logs in to a second account's registry so a
+cross account base image can be pulled, skips a build whose tag already exists, and
+writes each build's digest to its own artifact so a matrix of calls can be collected.
 
 **Why `provenance: false`.** When buildx attaches provenance or SBOM attestations it
 publishes an OCI image index (a manifest list) rather than a single image manifest.
@@ -134,6 +137,72 @@ v1.0.0 and up, which is what a single platform build without attestations produc
 The workflow also asserts the pushed manifest media type is not an index, so a bad
 build fails here rather than at deploy time.
 
+**Why the CodeArtifact token is a BuildKit secret, not a build argument.** A build
+argument is recorded in `docker history` and readable by anyone who can pull the
+image. The token is minted after the credentials step, masked with `::add-mask::`,
+exported to the job environment, and handed to `docker/build-push-action` through
+`secret-envs`, which names the variable rather than carrying the value. The
+Dockerfile reads it with `RUN --mount=type=secret,id=codeartifact_token`. The
+mount id is the `codeartifact-secret-id` input, defaulting to `codeartifact_token`.
+The input names match `python-ci.yml` so the two workflows are configured the same
+way, with one difference: `codeartifact-domain-owner` is an input here, not a
+secret, because it is an account id rather than a credential and a matrix caller
+usually already has it in a repository variable.
+
+`codeartifact:GetAuthorizationToken` alone is not enough. The assumed role also
+needs `sts:GetServiceBearerToken` conditioned on
+`sts:AWSServiceName = codeartifact.amazonaws.com`; without it the call fails with a
+denial that names no CodeArtifact action at all.
+
+**Why `additional-ecr-registries` exists, and what it changes.** `amazon-ecr-login`
+with no `registries:` authenticates the caller's own account registry and nothing
+else, so a `FROM` pointing at a base image in another account fails with a 401 from
+a host Docker holds no credential for. That is a missing Docker credential, not a
+missing IAM grant, and it does not present as one. Passing account ids here logs in
+to those registries as well.
+
+Two consequences are handled inside the workflow. `amazon-ecr-login` takes a comma
+delimited list and stops assuming the default registry once a list is given, so the
+caller's own account id is prepended automatically and does not need naming. And its
+`registry` output is documented as not set when it logs in to more than one
+registry, so the workflow resolves the caller's own registry host from
+`sts get-caller-identity` plus `aws-region` instead of reading that output. The push
+target is unchanged either way: the caller's own account.
+
+**Why the existing tag guard.** ECR repositories in this estate are created with
+`IMMUTABLE` tags and the only tag is `sha-<full git sha>`, so re-running a green
+commit pushes a tag that already exists. If the rebuild is byte identical ECR treats
+the re-tag as a no-op and it succeeds; if anything moved, `PutImage` fails with
+`ImageTagAlreadyExistsException` for a reason unrelated to the commit under test.
+With `skip-if-tag-exists` left at its default the workflow resolves the tag first
+and, when it is already there, skips the build and emits the existing digest as the
+outputs, so the rerun is green and still returns a usable URI.
+
+The check uses `aws ecr batch-get-image`, not `describe-images`. A consumer deploy
+role typically holds `ecr:BatchGetImage` on its own domain repositories but
+`ecr:DescribeImages` only on the shared base image repository, so `describe-images`
+would be denied on exactly the repositories this needs to read.
+
+**Why the manifest artifact.** A matrix of reusable workflow calls collapses to one
+`needs` entry in the caller whose `outputs` hold whichever leg finished last, and a
+job with `uses:` cannot carry `steps:` to capture them itself. With
+`upload-manifest-artifact: true` each leg uploads a one file artifact named
+`image-<sanitised repository>-<tag>` containing:
+
+```json
+{
+  "repository": "webbpulse-staging/content",
+  "tag": "sha-<full git sha>",
+  "digest": "sha256:...",
+  "image_uri": "<account>.dkr.ecr.<region>.amazonaws.com/webbpulse-staging/content@sha256:..."
+}
+```
+
+A downstream job reads all of them with `actions/download-artifact` using
+`pattern: image-*` and `merge-multiple: true`, which lands one JSON file per leg in
+a single directory, and assembles the `function-image-map` that
+`lambda-image-deploy.yml` takes.
+
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `ecr-repository` | string | required | Repository name only, no registry host. |
@@ -142,17 +211,28 @@ build fails here rather than at deploy time.
 | `dockerfile` | string | `Dockerfile` | |
 | `platform` | string | `linux/arm64` | Exactly one platform. |
 | `build-args` | string | `""` | Newline separated build arguments. |
+| `codeartifact-domain` | string | `""` | Empty skips minting a token. |
+| `codeartifact-domain-owner` | string | `""` | Account id owning the domain. Required when `codeartifact-domain` is set. |
+| `codeartifact-repository` | string | `""` | Required when `codeartifact-domain` is set. |
+| `codeartifact-secret-id` | string | `codeartifact_token` | BuildKit secret id the Dockerfile mounts. |
+| `additional-ecr-registries` | string | `""` | Comma or newline separated account ids. The caller's own is always included. |
+| `skip-if-tag-exists` | boolean | `true` | Skip the build when the tag already resolves, and emit the existing digest. |
+| `upload-manifest-artifact` | boolean | `false` | Upload the per leg JSON manifest. |
+| `artifact-name` | string | `""` | Overrides the default `image-<sanitised repository>-<tag>`. |
 | `runs-on` | string | `ubuntu-latest` | |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
-| `role-to-assume` | yes | Allowed to push to the ECR repository. |
+| `role-to-assume` | yes | Allowed to push to the ECR repository, and to read CodeArtifact and any additional registry when those are used. |
 
 | Output | Notes |
 | --- | --- |
-| `image-digest` | `sha256:...` |
+| `image-digest` | `sha256:...`, whether built or already present. |
 | `image-uri` | `registry/repository@sha256:...` |
 | `image-tag` | `sha-<full git sha>` |
+| `image-existed` | `true` when the tag already resolved and the build was skipped. |
+
+Single image, no CodeArtifact, no cross account base:
 
 ```yaml
 jobs:
@@ -168,6 +248,75 @@ jobs:
       dockerfile: backend/Dockerfile
     secrets:
       role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+```
+
+Four domain images from one Dockerfile, with the CodeArtifact token, a base image
+pulled from the Artifacts account, and the per leg manifests collected into a
+`function-image-map`:
+
+```yaml
+jobs:
+  build-images:
+    strategy:
+      fail-fast: false
+      matrix:
+        domain: [content, resume, identity, public]
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    uses: WebbPulse/.github/.github/workflows/container-image.yml@v1
+    with:
+      ecr-repository: webbpulse-${{ github.ref_name == 'main' && 'production' || 'staging' }}/${{ matrix.domain }}
+      aws-region: us-west-2
+      context: backend
+      dockerfile: backend/Dockerfile
+      platform: linux/arm64
+      build-args: |
+        DOMAIN=${{ matrix.domain }}
+        READINESS_PROTOCOL=${{ matrix.domain == 'public' && 'tcp' || 'http' }}
+      codeartifact-domain: webbpulse
+      codeartifact-domain-owner: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+      codeartifact-repository: python
+      # The Artifacts account, which holds the shared python-lambda-base image the
+      # Dockerfile's FROM pins by digest.
+      additional-ecr-registries: "432410731887"
+      upload-manifest-artifact: true
+    secrets:
+      role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+
+  image-map:
+    needs: build-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      function-image-map: ${{ steps.map.outputs.function-image-map }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: manifests
+          pattern: image-*
+          merge-multiple: true
+
+      - id: map
+        env:
+          ENVIRONMENT: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+        run: |
+          set -euo pipefail
+          MAP=$(python3 - <<'PY'
+          import json, os, pathlib
+
+          env = os.environ["ENVIRONMENT"]
+          out = {}
+          for path in sorted(pathlib.Path("manifests").glob("*.json")):
+              m = json.loads(path.read_text())
+              domain = m["repository"].rsplit("/", 1)[-1]
+              out[f"webbpulse-{env}-{domain}"] = m["image_uri"]
+          print(json.dumps(out))
+          PY
+          )
+          echo "function-image-map=${MAP}" >> "$GITHUB_OUTPUT"
 ```
 
 ---
