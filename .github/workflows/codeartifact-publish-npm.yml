@@ -98,8 +98,13 @@ on:
 permissions:
   contents: read
 
+# Keyed per package directory. A concurrency group holds one running and one
+# pending job and cancels the rest, so a matrix of four packages sharing one group
+# publishes two and cancels two. Different packages never conflict; the same
+# package publishing twice is serialised and the second run finds the version
+# already present and skips.
 concurrency:
-  group: codeartifact-publish-npm-${{ github.repository }}-${{ inputs.codeartifact-repository }}
+  group: codeartifact-publish-npm-${{ github.repository }}-${{ inputs.codeartifact-repository }}-${{ inputs.working-directory }}
   cancel-in-progress: false
 
 jobs:
