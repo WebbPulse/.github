@@ -80,6 +80,7 @@ report as an artifact.
 | `node-version` | string | `22` | |
 | `working-directory` | string | `frontend` | |
 | `package-manager` | string | `npm` | `npm` or `pnpm`. Picks the cache and lockfile. |
+| `cache-dependency-path` | string | `""` | Lockfile path for the setup-node cache, from the repository root. Empty derives `<working-directory>/package-lock.json`. See [Workspaces monorepos](#workspaces-monorepos). |
 | `install-command` | string | `""` | Empty means `npm ci` or `pnpm install --frozen-lockfile`. |
 | `lint-command` | string | `npm run lint` | Empty skips the step. |
 | `format-check-command` | string | `""` | Empty skips the step. |
@@ -265,6 +266,8 @@ not report success before the edge is serving the build.
 | `node-version` | string | `22` | |
 | `working-directory` | string | `frontend` | |
 | `package-manager` | string | `npm` | `npm` or `pnpm`. |
+| `cache-dependency-path` | string | `""` | Lockfile path for the setup-node cache, from the repository root. Empty derives `<working-directory>/package-lock.json`. See [Workspaces monorepos](#workspaces-monorepos). |
+| `install-command` | string | `""` | Empty means `npm ci` or `pnpm install --frozen-lockfile`. |
 | `build-command` | string | `npm run build` | |
 | `build-output-directory` | string | `dist` | Relative to `working-directory`. |
 | `build-env-json` | string | `{}` | JSON object of build variables. |
@@ -327,9 +330,18 @@ needs `codeartifact:PublishPackageVersion`, `codeartifact:PutPackageMetadata`,
 repository. Tokens last 12 hours by default.
 
 Shared inputs: `working-directory`, `codeartifact-domain` (required),
-`codeartifact-repository` (required), `aws-region` (required), `environment`,
-`runs-on`, plus `python-version` or `node-version` / `package-manager` /
-`build-command`.
+`codeartifact-repository` (required), `aws-region` (required), `environment` and
+`runs-on`. `codeartifact-publish-python.yml` adds `python-version`.
+
+`codeartifact-publish-npm.yml` adds:
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `node-version` | string | `22` | |
+| `package-manager` | string | `npm` | `npm` or `pnpm`. Picks the cache and lockfile. |
+| `cache-dependency-path` | string | `""` | Lockfile path for the setup-node cache, from the repository root. Empty derives `<working-directory>/package-lock.json`, or `pnpm-lock.yaml` for pnpm. See [Workspaces monorepos](#workspaces-monorepos). |
+| `install-command` | string | `""` | Install command, run from `working-directory`. Empty means `npm ci` or `pnpm install --frozen-lockfile`. See [Workspaces monorepos](#workspaces-monorepos). |
+| `build-command` | string | `npm run build` | Empty skips the build. |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
@@ -383,6 +395,45 @@ resolves the publish target for `@scope/name` from a `@scope:registry` setting o
 therefore binds `@scope:registry` to the CodeArtifact endpoint explicitly, and asserts
 the resolved registry is CodeArtifact before uploading, so a private package can never
 be published to the public registry by accident.
+
+### Workspaces monorepos
+
+Applies to `codeartifact-publish-npm.yml`, `typescript-ci.yml` and `spa-deploy.yml`.
+
+In a single package repository the lockfile sits next to `package.json`, so deriving
+the setup-node cache path as `<working-directory>/package-lock.json` is right. An npm
+**workspaces** repository breaks that assumption in two places at once:
+
+1. **The lockfile is only at the repository root.** `packages/<name>/package-lock.json`
+   does not exist, and `actions/setup-node` **fails the step** when the cache path
+   matches nothing, with `Some specified paths were not resolved, unable to cache
+   dependencies`. The job dies at setup, before any build or publish step runs.
+2. **The install has to run at the root.** `npm ci` inside a package directory installs
+   that package's own dependencies only. Build tooling such as `tsup` and `typescript`
+   is normally a root `devDependency`, so a package level install leaves the build
+   without its binaries.
+
+`working-directory` must still be the package directory, because the metadata, build
+and publish steps read `package.json` and run `npm publish` there. Point the other two
+at the root instead:
+
+```yaml
+with:
+  working-directory: packages/api-client
+  cache-dependency-path: package-lock.json
+  install-command: npm ci --no-progress --prefix ../..
+  build-command: npm run build --if-present --prefix ../.. --workspace "@webbpulse/api-client"
+```
+
+`cache-dependency-path` is relative to the **repository root**, not to
+`working-directory`, because `actions/setup-node` resolves it from the workspace root.
+`install-command` runs from `working-directory`, so it reaches the root with a relative
+`--prefix`. Both default to `""`, which reproduces the previous derived behaviour
+exactly, so a single package caller changes nothing.
+
+Before these inputs existed the only workaround was to fold the root install into
+`build-command`. That still left the setup-node cache step failing on the missing
+lockfile, so it never actually got as far as building.
 
 ---
 

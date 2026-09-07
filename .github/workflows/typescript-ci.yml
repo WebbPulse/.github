@@ -22,6 +22,15 @@ on:
         type: string
         required: false
         default: "npm"
+      cache-dependency-path:
+        description: >-
+          Lockfile path for the setup-node cache, relative to the repository root.
+          Empty derives <working-directory>/package-lock.json, or pnpm-lock.yaml for
+          pnpm. A workspaces monorepo keeps its only lockfile at the repository root,
+          so pass "package-lock.json" there.
+        type: string
+        required: false
+        default: ""
       install-command:
         description: "Override the install command. Empty means npm ci or pnpm install --frozen-lockfile."
         type: string
@@ -126,7 +135,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/{1}', inputs.working-directory, inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json') }}
 
       # CodeArtifact hosts the shared WebbPulse TypeScript packages. The npm login
       # writes the registry and auth token into ~/.npmrc, so it has to run before the
@@ -246,7 +255,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/{1}', inputs.working-directory, inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json') }}
 
       - name: Install dependencies
         env:

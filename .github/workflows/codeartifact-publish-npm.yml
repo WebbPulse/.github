@@ -6,6 +6,13 @@
 #
 # Nothing in this file is estate specific. Domain, repository, domain owner and the
 # role ARN arrive from the calling repository.
+#
+# Workspaces monorepos. working-directory is the package directory, because the
+# metadata, build and publish steps all read package.json and run npm publish there.
+# The lockfile of a workspaces repository, however, lives at the repository root and
+# the install has to run there too, or the shared devDependencies are missing. Pass
+# cache-dependency-path and install-command to point those two at the root while
+# working-directory stays on the package.
 name: CodeArtifact Publish npm
 
 on:
@@ -26,6 +33,23 @@ on:
         type: string
         required: false
         default: "npm"
+      cache-dependency-path:
+        description: >-
+          Lockfile path for the setup-node cache, relative to the repository root.
+          Empty derives <working-directory>/package-lock.json, or pnpm-lock.yaml for
+          pnpm. A workspaces monorepo keeps its only lockfile at the repository root,
+          so pass "package-lock.json" there.
+        type: string
+        required: false
+        default: ""
+      install-command:
+        description: >-
+          Install command, run from working-directory. Empty means npm ci or
+          pnpm install --frozen-lockfile. A workspaces monorepo installs from the
+          repository root, for example "npm ci --no-progress --prefix ../..".
+        type: string
+        required: false
+        default: ""
       build-command:
         description: "Build command run before publishing. Empty skips the build."
         type: string
@@ -105,7 +129,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/{1}', inputs.working-directory, inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json') }}
 
       - name: Read the package metadata
         id: metadata
@@ -210,9 +234,12 @@ jobs:
       - name: Install dependencies
         if: steps.exists.outputs.exists != 'true'
         env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
-          if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+          if [ -n "$INSTALL_COMMAND" ]; then
+            eval "$INSTALL_COMMAND"
+          elif [ "$PACKAGE_MANAGER" = "pnpm" ]; then
             corepack enable
             pnpm install --frozen-lockfile
           else

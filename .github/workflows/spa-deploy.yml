@@ -27,6 +27,22 @@ on:
         type: string
         required: false
         default: "npm"
+      cache-dependency-path:
+        description: >-
+          Lockfile path for the setup-node cache, relative to the repository root.
+          Empty derives <working-directory>/package-lock.json, or pnpm-lock.yaml for
+          pnpm. A workspaces monorepo keeps its only lockfile at the repository root,
+          so pass "package-lock.json" there.
+        type: string
+        required: false
+        default: ""
+      install-command:
+        description: >-
+          Install command, run from working-directory. Empty means npm ci or
+          pnpm install --frozen-lockfile.
+        type: string
+        required: false
+        default: ""
       build-command:
         description: "Build command."
         type: string
@@ -120,14 +136,17 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/{1}', inputs.working-directory, inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json') }}
 
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
         env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
-          if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+          if [ -n "$INSTALL_COMMAND" ]; then
+            eval "$INSTALL_COMMAND"
+          elif [ "$PACKAGE_MANAGER" = "pnpm" ]; then
             corepack enable
             pnpm install --frozen-lockfile
           else
