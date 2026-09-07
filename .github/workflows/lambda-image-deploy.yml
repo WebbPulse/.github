@@ -146,6 +146,10 @@ jobs:
             echo "Image: $IMAGE"
 
             # Settle any in flight configuration change before writing new code.
+            # While LastUpdateStatus is InProgress the Lambda documentation states
+            # that UpdateFunctionCode, UpdateFunctionConfiguration and PublishVersion
+            # all fail, so this wait is what keeps a deploy from colliding with a
+            # Terraform apply that is still writing function configuration.
             aws lambda wait function-updated-v2 --function-name "$FUNCTION"
 
             PUBLISH_FLAG=()
@@ -153,12 +157,47 @@ jobs:
               PUBLISH_FLAG=(--publish)
             fi
 
-            aws lambda update-function-code \
-              --function-name "$FUNCTION" \
-              --image-uri "$IMAGE" \
-              "${PUBLISH_FLAG[@]}" \
-              --query '{Version: Version, CodeSha256: CodeSha256, LastModified: LastModified}' \
-              --output table
+            # The wait above closes most of the window, but a Terraform apply can
+            # start a new configuration update in the gap between the wait returning
+            # and the call below landing. That surfaces as ResourceConflictException,
+            # so retry it rather than failing the deploy. Any other error is fatal.
+            ATTEMPT=1
+            MAX_ATTEMPTS=6
+            while true; do
+              set +e
+              OUTPUT=$(aws lambda update-function-code \
+                --function-name "$FUNCTION" \
+                --image-uri "$IMAGE" \
+                "${PUBLISH_FLAG[@]}" \
+                --query '{Version: Version, CodeSha256: CodeSha256, LastModified: LastModified}' \
+                --output table 2>&1)
+              STATUS=$?
+              set -e
+
+              if [ "$STATUS" -eq 0 ]; then
+                echo "$OUTPUT"
+                break
+              fi
+
+              if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+                echo "$OUTPUT"
+                echo "update-function-code failed after $ATTEMPT attempts."
+                exit 1
+              fi
+
+              case "$OUTPUT" in
+                *ResourceConflictException*)
+                  echo "Conflicting update in flight, attempt $ATTEMPT/$MAX_ATTEMPTS. Waiting and retrying."
+                  aws lambda wait function-updated-v2 --function-name "$FUNCTION" || true
+                  sleep $(( ATTEMPT * 5 ))
+                  ATTEMPT=$(( ATTEMPT + 1 ))
+                  ;;
+                *)
+                  echo "$OUTPUT"
+                  exit 1
+                  ;;
+              esac
+            done
 
             # Container image functions stay Pending while Lambda optimizes the image.
             aws lambda wait function-updated-v2 --function-name "$FUNCTION"

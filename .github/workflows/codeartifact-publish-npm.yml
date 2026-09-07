@@ -95,6 +95,10 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this workflow uses the checkout token afterwards, so the
+          # credentials are not left behind in .git/config for later steps to reuse.
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -176,12 +180,32 @@ jobs:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
           CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          PACKAGE_NAMESPACE: ${{ steps.metadata.outputs.package-namespace }}
         run: |
+          set -euo pipefail
+          # login --tool npm writes the auth token into ~/.npmrc and sets the default
+          # registry to this repository.
           aws codeartifact login \
             --tool npm \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
             --repository "$CODEARTIFACT_REPOSITORY"
+
+          # The default registry alone is not enough for a scoped package. npm resolves
+          # the publish target for @scope/name from a @scope:registry setting (or from
+          # publishConfig in package.json) before falling back to the default registry,
+          # so a package.json carrying neither could publish somewhere else entirely.
+          # Bind the scope explicitly to the same endpoint login just configured.
+          if [ -n "$PACKAGE_NAMESPACE" ]; then
+            REGISTRY=$(aws codeartifact get-repository-endpoint \
+              --domain "$CODEARTIFACT_DOMAIN" \
+              --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+              --repository "$CODEARTIFACT_REPOSITORY" \
+              --format npm \
+              --query repositoryEndpoint --output text)
+            npm config set "@${PACKAGE_NAMESPACE}:registry=${REGISTRY}"
+            echo "Bound @${PACKAGE_NAMESPACE} to the CodeArtifact repository."
+          fi
 
       - name: Install dependencies
         if: steps.exists.outputs.exists != 'true'
@@ -204,6 +228,7 @@ jobs:
         env:
           ALREADY_EXISTS: ${{ steps.exists.outputs.exists }}
           PACKAGE_NAME: ${{ steps.metadata.outputs.package-name }}
+          PACKAGE_NAMESPACE: ${{ steps.metadata.outputs.package-namespace }}
           PACKAGE_VERSION: ${{ steps.metadata.outputs.package-version }}
           CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
         run: |
@@ -212,6 +237,22 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Publishing a private package to the public registry is not recoverable, so
+          # assert the resolved target is CodeArtifact before uploading anything.
+          TARGET=$(npm config get registry)
+          if [ -n "$PACKAGE_NAMESPACE" ]; then
+            TARGET=$(npm config get "@${PACKAGE_NAMESPACE}:registry")
+          fi
+          case "$TARGET" in
+            *.codeartifact.*|*.on.aws/*)
+              echo "Publishing to $TARGET"
+              ;;
+            *)
+              echo "Refusing to publish: resolved registry $TARGET is not CodeArtifact."
+              exit 1
+              ;;
+          esac
+
           npm publish --no-progress
           echo "published=true" >> "$GITHUB_OUTPUT"
           echo "Published ${PACKAGE_NAME} ${PACKAGE_VERSION} to ${CODEARTIFACT_REPOSITORY}." >> "$GITHUB_STEP_SUMMARY"

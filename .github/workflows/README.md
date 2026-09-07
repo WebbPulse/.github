@@ -44,8 +44,8 @@ private packages resolve during the install.
 | `coverage-source` | string | `app` | Package measured by coverage. |
 | `runs-on` | string | `ubuntu-latest` | Runner label. |
 | `codeartifact-domain` | string | `""` | Non empty enables the CodeArtifact login. |
-| `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`. |
-| `aws-region` | string | `""` | Required with `codeartifact-domain`. |
+| `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`, and validated at run time. |
+| `aws-region` | string | `""` | Required with `codeartifact-domain`, and validated at run time. |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
@@ -57,7 +57,7 @@ Outputs: none.
 ```yaml
 jobs:
   backend-ci:
-    uses: WebbPulse/.github/.github/workflows/python-ci.yml@main
+    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v1
     with:
       working-directory: backend
       coverage-source: app
@@ -100,7 +100,7 @@ Outputs: none.
 ```yaml
 jobs:
   frontend-ci:
-    uses: WebbPulse/.github/.github/workflows/typescript-ci.yml@main
+    uses: WebbPulse/.github/.github/workflows/typescript-ci.yml@v1
     with:
       working-directory: frontend
       node-version: "22"
@@ -150,7 +150,7 @@ build fails here rather than at deploy time.
 ```yaml
 jobs:
   image:
-    uses: WebbPulse/.github/.github/workflows/container-image.yml@main
+    uses: WebbPulse/.github/.github/workflows/container-image.yml@v1
     with:
       ecr-repository: ${{ vars.ECR_REPOSITORY }}
       aws-region: ${{ vars.AWS_REGION }}
@@ -168,6 +168,16 @@ Points one or many functions at an image URI: waits for the function to settle,
 runs `update-function-code --image-uri`, waits again with `function-updated-v2`
 (container image functions stay `Pending` while Lambda optimizes the image), then
 optionally probes a smoke URL with retries.
+
+**Why it waits before updating, and retries.** Terraform owns function configuration
+in this estate, and `image_uri` is under `ignore_changes` in the Lambda module, so a
+deploy only ever moves the digest. But a Terraform apply changing configuration can be
+in flight when a deploy starts. The Lambda documentation states that while
+`"LastUpdateStatus": "InProgress"`, `UpdateFunctionCode`, `UpdateFunctionConfiguration`
+and `PublishVersion` all fail. So the deploy waits with `function-updated-v2` **before**
+calling `update-function-code`, and additionally retries `ResourceConflictException`
+with a backoff, because an apply can still start in the gap between the wait returning
+and the update landing. Any other error fails the deploy immediately.
 
 Pass either `function-name` plus `image-uri`, or a `function-image-map` JSON object
 of function name to image URI. The map form is how a multi domain deploy fans out.
@@ -198,7 +208,7 @@ Outputs: none.
 jobs:
   deploy:
     needs: image
-    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@main
+    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v1
     with:
       aws-region: ${{ vars.AWS_REGION }}
       environment: production
@@ -215,12 +225,28 @@ jobs:
 
 Builds the frontend, syncs to S3 in two passes, and invalidates CloudFront.
 
-The two passes exist so a deploy is never briefly broken. Pass one uploads the
-hashed `assets/*` files with `max-age=31536000, immutable` and no `--delete`, so the
-assets the currently served `index.html` references stay in place. Pass two uploads
-`index.html` and the other unhashed files with `no-cache` and runs `--delete`, which
-prunes stale objects including old hashed assets. The invalidation then waits for
-completion so the job does not report success before the edge is serving the build.
+Three passes, in this order, so a deploy is never briefly broken:
+
+1. **Hashed assets**, `max-age=31536000, immutable`, no `--delete`. The assets the
+   currently served `index.html` references stay in place.
+2. **Entry files** (`index.html` and anything else unhashed), `no-cache`, still no
+   `--delete`. Once this lands the edge serves the new HTML, and both the new and the
+   previous asset sets are present, so no request can miss.
+3. **Prune**, `--delete` over the whole tree with no filters.
+
+Pass three is separate on purpose. The AWS CLI documents `--delete` as "Files that
+exist in the destination but not in the source are deleted during sync. Note that
+files excluded by filters are excluded from deletion." A `--delete` carried on either
+filtered pass would therefore never prune what that pass filtered out, so stale hashed
+assets would accumulate in the bucket forever. Pass three uploads nothing new, because
+the first two passes already uploaded every source file, so the cache headers set
+above are preserved.
+
+`/index.html` and `/` are always invalidated: `/` is what a visitor requests and
+`/index.html` is what the origin serves for it. Hashed assets never need invalidating,
+because a new build gives them new keys. `invalidation-paths` appends extra paths, and
+`/*` invalidates everything. The invalidation then waits for completion so the job does
+not report success before the edge is serving the build.
 
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -233,7 +259,7 @@ completion so the job does not report success before the edge is serving the bui
 | `s3-bucket` | string | required | |
 | `s3-prefix` | string | `""` | Optional key prefix. |
 | `cloudfront-distribution-id` | string | `""` | Empty skips the invalidation. |
-| `invalidation-paths` | string | `/*` | Space separated. |
+| `invalidation-paths` | string | `""` | Space separated **extra** paths. `/index.html` and `/` are always invalidated. |
 | `immutable-asset-globs` | string | `assets/*` | Files treated as content hashed. |
 | `aws-region` | string | required | |
 | `environment` | string | `""` | GitHub Environment. |
@@ -249,7 +275,7 @@ Outputs: none.
 ```yaml
 jobs:
   deploy-frontend:
-    uses: WebbPulse/.github/.github/workflows/spa-deploy.yml@main
+    uses: WebbPulse/.github/.github/workflows/spa-deploy.yml@v1
     with:
       environment: production
       s3-bucket: ${{ vars.FRONTEND_S3_BUCKET }}
@@ -304,7 +330,7 @@ Shared inputs: `working-directory`, `codeartifact-domain` (required),
 ```yaml
 jobs:
   publish:
-    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@main
+    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v1
     with:
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
       codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
@@ -313,6 +339,29 @@ jobs:
       role-to-assume: ${{ secrets.CODEARTIFACT_PUBLISH_ROLE_ARN }}
       codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
 ```
+
+The npm workflow is called the same way:
+
+```yaml
+jobs:
+  publish:
+    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-npm.yml@v1
+    with:
+      codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
+      codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
+      aws-region: ${{ vars.AWS_REGION }}
+      working-directory: packages/shared
+    secrets:
+      role-to-assume: ${{ secrets.CODEARTIFACT_PUBLISH_ROLE_ARN }}
+      codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
+```
+
+**Scoped npm packages.** `login --tool npm` sets the *default* registry, but npm
+resolves the publish target for `@scope/name` from a `@scope:registry` setting or from
+`publishConfig` in `package.json` before falling back to the default. The workflow
+therefore binds `@scope:registry` to the CodeArtifact endpoint explicitly, and asserts
+the resolved registry is CodeArtifact before uploading, so a private package can never
+be published to the public registry by accident.
 
 ---
 
@@ -347,12 +396,92 @@ on:
 
 jobs:
   terraform-checks:
-    uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@main
+    uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@v1
     with:
       working-directory: terraform
     secrets:
       tf-api-token: ${{ secrets.TFC_API_TOKEN }}
 ```
+
+---
+
+## Releasing and what callers pin to
+
+Callers must pin to a **tag or a commit SHA of this repository**, never to `@main`.
+A reusable workflow referenced by a branch changes underneath every caller the moment
+this repository is pushed to, and in this estate every push to `main` reaches
+production through the callers.
+
+The release approach is a moving major tag:
+
+- Every change lands on `main` behind a pull request.
+- A release is cut as an immutable `vMAJOR.MINOR.PATCH` tag, for example `v1.4.0`.
+- The `v1` major tag is then **moved** to that commit. Callers pin `@v1` and pick up
+  backward compatible fixes without editing anything.
+- A breaking change to any input, secret or output means a new major tag (`v2`), and
+  `v1` stops moving. Callers migrate deliberately.
+
+```bash
+git tag -a v1.4.0 -m "Describe the change"
+git push origin v1.4.0
+git tag -f v1          # move the major tag
+git push -f origin v1
+```
+
+A caller that wants no moving target at all pins the SHA instead, with the tag in a
+comment, exactly as this repository pins third party actions:
+
+```yaml
+uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v1.4.0
+```
+
+Both forms are fine. `@v1` is the default; pin a SHA where a repository needs a
+change to this repository to be an explicit, reviewed event.
+
+---
+
+## Adopting in an existing repo
+
+What a caller repository has to provide before these workflows will run.
+
+**Repository content**
+
+- A **ruff** configuration for `python-ci.yml`, in `pyproject.toml` (`[tool.ruff]`) or
+  `ruff.toml`, and `ruff` present in the dev requirements the `install-command`
+  installs. The workflow runs `ruff check` and `ruff format --check`, so a repository
+  that has never run the formatter should run `ruff format` once and commit first.
+- `lint`, `type-check` and `build` scripts in `package.json` for `typescript-ci.yml`,
+  or the matching `*-command` inputs set to `""` to skip them.
+- A `Dockerfile` that builds for a single architecture for `container-image.yml`.
+
+**GitHub configuration**
+
+- An Environment per stage (`staging`, `production`) holding the `vars` the snippets
+  above read, and the deploy role ARN as an Environment secret.
+- Nothing estate specific committed to this repository. Bucket names, distribution
+  ids, function names, ECR repositories and regions live in caller `vars`.
+
+**OIDC trust**
+
+Each role trusts `token.actions.githubusercontent.com`, with `sub` scoped to the
+calling repository and ideally to the environment, and audience `sts.amazonaws.com`.
+Roles are assumed by `aws-actions/configure-aws-credentials`, which needs
+`id-token: write` on the calling job. Callers do not set that permission themselves:
+each reusable workflow requests it on its own jobs, and only where OIDC is used.
+
+**IAM permissions, per workflow**
+
+| Workflow | Actions the role needs |
+| --- | --- |
+| `container-image.yml` | `ecr:GetAuthorizationToken` (on `*`), plus on the repository: `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`, `ecr:BatchGetImage` (the manifest assertion) |
+| `lambda-image-deploy.yml` | `lambda:UpdateFunctionCode`, `lambda:GetFunction` (the waiter polls it), and `lambda:PublishVersion` when `publish-version` is true |
+| `spa-deploy.yml` | `s3:ListBucket` on the bucket; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `bucket/*` (`DeleteObject` is needed by the prune pass); `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` on the distribution |
+| `codeartifact-publish-*.yml` | `sts:GetServiceBearerToken` (on `*`), `codeartifact:GetAuthorizationToken` on the domain, and on the repository `codeartifact:PublishPackageVersion`, `codeartifact:PutPackageMetadata`, `codeartifact:ReadFromRepository`, `codeartifact:DescribePackageVersion` |
+| `python-ci.yml` / `typescript-ci.yml` | Only when the CodeArtifact login is enabled: `sts:GetServiceBearerToken`, `codeartifact:GetAuthorizationToken`, `codeartifact:ReadFromRepository`. Read only, no publish. |
+| `terraform-speculative-plan.yml` | No AWS role. It needs only the HCP token secret. |
+
+`sts:GetServiceBearerToken` is the one that is easy to miss. Without it the
+CodeArtifact login fails with an access denied that names no CodeArtifact action.
 
 ---
 

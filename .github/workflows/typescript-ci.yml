@@ -116,6 +116,10 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this workflow uses the checkout token afterwards, so the
+          # credentials are not left behind in .git/config for later steps to reuse.
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -128,6 +132,24 @@ jobs:
       # writes the registry and auth token into ~/.npmrc, so it has to run before the
       # install step. GetAuthorizationToken needs both codeartifact:GetAuthorizationToken
       # and sts:GetServiceBearerToken on the assumed role.
+      # aws-region is a required input on configure-aws-credentials, and
+      # codeartifact-repository is required by the login below, so fail with a clear
+      # message here rather than an opaque action error further down.
+      - name: Validate the CodeArtifact inputs
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          AWS_REGION_INPUT: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -n "$CODEARTIFACT_REPOSITORY" ] || MISSING="$MISSING codeartifact-repository"
+          [ -n "$AWS_REGION_INPUT" ] || MISSING="$MISSING aws-region"
+          if [ -n "$MISSING" ]; then
+            echo "codeartifact-domain is set, so these inputs are required too:$MISSING"
+            exit 1
+          fi
+
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
@@ -214,6 +236,10 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this workflow uses the checkout token afterwards, so the
+          # credentials are not left behind in .git/config for later steps to reuse.
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

@@ -76,6 +76,10 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No step in this workflow uses the checkout token afterwards, so the
+          # credentials are not left behind in .git/config for later steps to reuse.
+          persist-credentials: false
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
@@ -150,15 +154,32 @@ jobs:
           REPOSITORY: ${{ inputs.ecr-repository }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
           MEDIA_TYPE=$(aws ecr batch-get-image \
             --repository-name "$REPOSITORY" \
             --image-ids "imageDigest=$DIGEST" \
             --query 'images[0].imageManifestMediaType' \
             --output text)
           echo "Manifest media type: $MEDIA_TYPE"
+
+          # An assertion that cannot read the media type must fail, not pass. The CLI
+          # prints None for a missing field, and batch-get-image reports an unknown
+          # digest in failures[] while still exiting 0, so both cases land here.
+          if [ -z "$MEDIA_TYPE" ] || [ "$MEDIA_TYPE" = "None" ]; then
+            echo "Could not read the manifest media type for $DIGEST."
+            exit 1
+          fi
+
           case "$MEDIA_TYPE" in
-            *manifest.list.v2+json | *image.index.v1+json)
+            application/vnd.docker.distribution.manifest.list.v2+json | application/vnd.oci.image.index.v1+json)
               echo "The image is a multi architecture index. Lambda does not support this."
+              exit 1
+              ;;
+            application/vnd.docker.distribution.manifest.v2+json | application/vnd.oci.image.manifest.v1+json)
+              echo "Single platform image manifest. Lambda accepts this."
+              ;;
+            *)
+              echo "Unrecognised manifest media type $MEDIA_TYPE. Refusing to deploy it."
               exit 1
               ;;
           esac
