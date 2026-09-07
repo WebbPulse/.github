@@ -1,0 +1,252 @@
+# Reusable TypeScript / Vite CI for WebbPulse frontends and shared packages.
+#
+# Nothing in this file is estate specific. Every account id, ARN, domain owner and
+# repository name arrives from the calling repository as an input or a secret.
+name: TypeScript CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to set up."
+        type: string
+        required: false
+        default: "22"
+      working-directory:
+        description: "Directory holding package.json."
+        type: string
+        required: false
+        default: "frontend"
+      package-manager:
+        description: "Package manager to use: npm or pnpm."
+        type: string
+        required: false
+        default: "npm"
+      install-command:
+        description: "Override the install command. Empty means npm ci or pnpm install --frozen-lockfile."
+        type: string
+        required: false
+        default: ""
+      lint-command:
+        description: "Lint command. Empty skips linting."
+        type: string
+        required: false
+        default: "npm run lint"
+      format-check-command:
+        description: "Format check command. Empty skips the check."
+        type: string
+        required: false
+        default: ""
+      typecheck-command:
+        description: "Type check command. Empty skips type checking."
+        type: string
+        required: false
+        default: "npm run type-check"
+      test-command:
+        description: "Unit test command. Empty skips unit tests."
+        type: string
+        required: false
+        default: "npm test -- --run --coverage"
+      build-command:
+        description: "Build command. Empty skips the build."
+        type: string
+        required: false
+        default: "npm run build"
+      run-playwright:
+        description: "Run the Playwright end to end job."
+        type: boolean
+        required: false
+        default: false
+      playwright-command:
+        description: "Playwright command, run after the browsers are installed."
+        type: string
+        required: false
+        default: "npx playwright test"
+      playwright-browsers:
+        description: "Browsers passed to playwright install."
+        type: string
+        required: false
+        default: "chromium"
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+      codeartifact-domain:
+        description: "CodeArtifact domain. Leave empty to skip the CodeArtifact login step."
+        type: string
+        required: false
+        default: ""
+      codeartifact-repository:
+        description: "CodeArtifact repository name. Required when codeartifact-domain is set."
+        type: string
+        required: false
+        default: ""
+      aws-region:
+        description: "AWS region for the CodeArtifact login."
+        type: string
+        required: false
+        default: ""
+      build-env-json:
+        description: "JSON object of extra environment variables exported before the build, for example Vite VITE_ values."
+        type: string
+        required: false
+        default: "{}"
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC to read from CodeArtifact."
+        required: false
+      codeartifact-domain-owner:
+        description: "AWS account id that owns the CodeArtifact domain."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  typescript-ci:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      # Needed only for the optional CodeArtifact login. Harmless when unused.
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      # CodeArtifact hosts the shared WebbPulse TypeScript packages. The npm login
+      # writes the registry and auth token into ~/.npmrc, so it has to run before the
+      # install step. GetAuthorizationToken needs both codeartifact:GetAuthorizationToken
+      # and sts:GetServiceBearerToken on the assumed role.
+      - name: Configure AWS credentials for CodeArtifact
+        if: inputs.codeartifact-domain != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to CodeArtifact for npm
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          aws codeartifact login \
+            --tool npm \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Install dependencies
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          if [ -n "$INSTALL_COMMAND" ]; then
+            eval "$INSTALL_COMMAND"
+          elif [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          else
+            npm ci --no-progress
+          fi
+
+      - name: Lint
+        if: inputs.lint-command != ''
+        run: ${{ inputs.lint-command }}
+
+      - name: Format check
+        if: inputs.format-check-command != ''
+        run: ${{ inputs.format-check-command }}
+
+      - name: Type check
+        if: inputs.typecheck-command != ''
+        run: ${{ inputs.typecheck-command }}
+
+      - name: Unit tests
+        if: inputs.test-command != ''
+        run: ${{ inputs.test-command }}
+
+      # Caller supplied build variables, for example the Vite VITE_ values the two
+      # apps pass today. Written with the multiline delimiter form so values
+      # containing newlines or equals signs survive intact.
+      - name: Apply the build environment
+        if: inputs.build-command != ''
+        env:
+          BUILD_ENV_JSON: ${{ inputs.build-env-json }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import uuid
+
+          values = json.loads(os.environ["BUILD_ENV_JSON"] or "{}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  delimiter = f"ghadelim_{uuid.uuid4().hex}"
+                  handle.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
+          print("Applied build environment keys: " + ", ".join(sorted(values)))
+          PY
+
+      - name: Build
+        if: inputs.build-command != ''
+        run: ${{ inputs.build-command }}
+
+  playwright:
+    if: inputs.run-playwright
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Install dependencies
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          if [ -n "$INSTALL_COMMAND" ]; then
+            eval "$INSTALL_COMMAND"
+          elif [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          else
+            npm ci --no-progress
+          fi
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ inputs.playwright-browsers }}
+
+      - name: Run Playwright tests
+        run: ${{ inputs.playwright-command }}
+
+      - name: Upload the Playwright report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: ${{ inputs.working-directory }}/playwright-report/
+          retention-days: 7
+          if-no-files-found: ignore

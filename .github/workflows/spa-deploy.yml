@@ -1,0 +1,229 @@
+# Reusable single page app deploy: build, sync to S3, invalidate CloudFront.
+#
+# Hashed Vite assets under assets/ are immutable, so they get a one year max-age.
+# index.html and the other unhashed entry files are re-fetched every time, so they
+# get no-cache. Uploading the hashed assets before index.html means a browser that
+# picks up the new HTML always finds the assets it references.
+#
+# Nothing in this file is estate specific. Bucket, distribution, role ARN and build
+# variables all arrive from the calling repository.
+name: SPA Deploy
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to set up."
+        type: string
+        required: false
+        default: "22"
+      working-directory:
+        description: "Directory holding package.json."
+        type: string
+        required: false
+        default: "frontend"
+      package-manager:
+        description: "Package manager to use: npm or pnpm."
+        type: string
+        required: false
+        default: "npm"
+      build-command:
+        description: "Build command."
+        type: string
+        required: false
+        default: "npm run build"
+      build-output-directory:
+        description: "Build output directory, relative to working-directory."
+        type: string
+        required: false
+        default: "dist"
+      build-env-json:
+        description: "JSON object of build time environment variables, for example Vite VITE_ values."
+        type: string
+        required: false
+        default: "{}"
+      s3-bucket:
+        description: "Destination S3 bucket name."
+        type: string
+        required: true
+      s3-prefix:
+        description: "Optional key prefix inside the bucket."
+        type: string
+        required: false
+        default: ""
+      cloudfront-distribution-id:
+        description: "CloudFront distribution to invalidate. Empty skips the invalidation."
+        type: string
+        required: false
+        default: ""
+      invalidation-paths:
+        description: "Space separated CloudFront invalidation paths."
+        type: string
+        required: false
+        default: "/*"
+      immutable-asset-globs:
+        description: "Space separated globs whose files carry hashed names and an immutable cache header."
+        type: string
+        required: false
+        default: "assets/*"
+      aws-region:
+        description: "AWS region."
+        type: string
+        required: true
+      environment:
+        description: "GitHub Environment providing deploy scoped variables and approvals."
+        type: string
+        required: false
+        default: ""
+      concurrency-group:
+        description: "Concurrency group so two deploys never overlap for the same target."
+        type: string
+        required: false
+        default: ""
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC, allowed to write the bucket and invalidate the distribution."
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.concurrency-group != '' && inputs.concurrency-group || format('spa-deploy-{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          else
+            npm ci --no-progress
+          fi
+
+      - name: Apply the build environment
+        env:
+          BUILD_ENV_JSON: ${{ inputs.build-env-json }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import uuid
+
+          values = json.loads(os.environ["BUILD_ENV_JSON"] or "{}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  delimiter = f"ghadelim_{uuid.uuid4().hex}"
+                  handle.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
+          print("Applied build environment keys: " + ", ".join(sorted(values)))
+          PY
+
+      # The build is purely local, so it runs before any AWS credentials exist.
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.build-command }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Sync the hashed assets
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          S3_BUCKET: ${{ inputs.s3-bucket }}
+          S3_PREFIX: ${{ inputs.s3-prefix }}
+          OUTPUT_DIR: ${{ inputs.build-output-directory }}
+          IMMUTABLE_GLOBS: ${{ inputs.immutable-asset-globs }}
+        run: |
+          set -euo pipefail
+          DESTINATION="s3://${S3_BUCKET}"
+          if [ -n "$S3_PREFIX" ]; then
+            DESTINATION="${DESTINATION}/${S3_PREFIX#/}"
+          fi
+          DESTINATION="${DESTINATION%/}/"
+
+          # Pass one: hashed assets only, long lived and immutable. No --delete here,
+          # so the assets the currently served index.html points at survive until the
+          # second pass replaces the HTML.
+          INCLUDES=()
+          for GLOB in $IMMUTABLE_GLOBS; do
+            INCLUDES+=(--include "$GLOB")
+          done
+          aws s3 sync "${OUTPUT_DIR}/" "$DESTINATION" \
+            --no-progress \
+            --exclude "*" \
+            "${INCLUDES[@]}" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Sync the entry files and prune
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          S3_BUCKET: ${{ inputs.s3-bucket }}
+          S3_PREFIX: ${{ inputs.s3-prefix }}
+          OUTPUT_DIR: ${{ inputs.build-output-directory }}
+          IMMUTABLE_GLOBS: ${{ inputs.immutable-asset-globs }}
+        run: |
+          set -euo pipefail
+          DESTINATION="s3://${S3_BUCKET}"
+          if [ -n "$S3_PREFIX" ]; then
+            DESTINATION="${DESTINATION}/${S3_PREFIX#/}"
+          fi
+          DESTINATION="${DESTINATION%/}/"
+
+          # Pass two: everything else, no-cache so a deploy is visible immediately.
+          # --delete runs here and prunes assets from earlier builds too, because the
+          # sync source is the whole build output directory.
+          EXCLUDES=()
+          for GLOB in $IMMUTABLE_GLOBS; do
+            EXCLUDES+=(--exclude "$GLOB")
+          done
+          aws s3 sync "${OUTPUT_DIR}/" "$DESTINATION" \
+            --no-progress \
+            --delete \
+            "${EXCLUDES[@]}" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront
+        if: inputs.cloudfront-distribution-id != ''
+        env:
+          DISTRIBUTION_ID: ${{ inputs.cloudfront-distribution-id }}
+          INVALIDATION_PATHS: ${{ inputs.invalidation-paths }}
+        run: |
+          # shellcheck disable=SC2086
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths $INVALIDATION_PATHS \
+            --query 'Invalidation.Id' --output text)
+          echo "Invalidation $INVALIDATION_ID created."
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --id "$INVALIDATION_ID"
+          echo "Invalidation $INVALIDATION_ID completed."

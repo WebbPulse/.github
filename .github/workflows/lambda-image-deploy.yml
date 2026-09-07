@@ -1,0 +1,193 @@
+# Reusable Lambda deploy for container image functions.
+#
+# Point one or many functions at an image URI, wait for each update to settle, then
+# optionally probe a smoke URL. Callers pass either a single function name plus a
+# single image URI, or a JSON object mapping function name to image URI.
+#
+# Nothing in this file is estate specific. Function names, image URIs, the role ARN
+# and the smoke URL all arrive from the calling repository.
+name: Lambda Image Deploy
+
+on:
+  workflow_call:
+    inputs:
+      function-name:
+        description: "Single Lambda function name. Ignored when function-image-map is set."
+        type: string
+        required: false
+        default: ""
+      image-uri:
+        description: "Image URI for function-name, ideally pinned by digest."
+        type: string
+        required: false
+        default: ""
+      function-image-map:
+        description: 'JSON object of function name to image URI, for example {"api":"...@sha256:..."}.'
+        type: string
+        required: false
+        default: ""
+      aws-region:
+        description: "AWS region holding the functions."
+        type: string
+        required: true
+      publish-version:
+        description: "Publish a new function version after the code update."
+        type: boolean
+        required: false
+        default: true
+      environment:
+        description: "GitHub Environment providing deploy scoped variables and approvals."
+        type: string
+        required: false
+        default: ""
+      concurrency-group:
+        description: "Concurrency group so two deploys never overlap for the same target."
+        type: string
+        required: false
+        default: ""
+      smoke-url:
+        description: "URL probed after the deploy. Empty skips the smoke test."
+        type: string
+        required: false
+        default: ""
+      smoke-expected-status:
+        description: "HTTP status the smoke URL must return."
+        type: string
+        required: false
+        default: "200"
+      smoke-attempts:
+        description: "Number of smoke test attempts."
+        type: number
+        required: false
+        default: 10
+      smoke-delay-seconds:
+        description: "Seconds between smoke test attempts."
+        type: number
+        required: false
+        default: 6
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC, allowed to update the functions."
+        required: true
+      smoke-header:
+        description: "Optional extra request header for the smoke test, as 'Name: value'."
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.concurrency-group != '' && inputs.concurrency-group || format('lambda-image-deploy-{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Resolve the deploy targets
+        id: targets
+        env:
+          FUNCTION_NAME: ${{ inputs.function-name }}
+          IMAGE_URI: ${{ inputs.image-uri }}
+          FUNCTION_IMAGE_MAP: ${{ inputs.function-image-map }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          raw_map = (os.environ.get("FUNCTION_IMAGE_MAP") or "").strip()
+          name = (os.environ.get("FUNCTION_NAME") or "").strip()
+          uri = (os.environ.get("IMAGE_URI") or "").strip()
+
+          if raw_map:
+              targets = json.loads(raw_map)
+              if not isinstance(targets, dict) or not targets:
+                  raise SystemExit("function-image-map must be a non empty JSON object.")
+          elif name and uri:
+              targets = {name: uri}
+          else:
+              raise SystemExit(
+                  "Pass either function-image-map, or both function-name and image-uri."
+              )
+
+          for function, image in targets.items():
+              if not isinstance(image, str) or not image:
+                  raise SystemExit(f"No image URI for function {function}.")
+
+          print("targets=" + json.dumps(targets, separators=(",", ":")))
+          PY
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Update the function code
+        env:
+          TARGETS: ${{ steps.targets.outputs.targets }}
+          PUBLISH_VERSION: ${{ inputs.publish-version }}
+        run: |
+          set -euo pipefail
+          FUNCTIONS=$(echo "$TARGETS" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)))")
+          while IFS= read -r FUNCTION; do
+            [ -n "$FUNCTION" ] || continue
+            IMAGE=$(echo "$TARGETS" | FN="$FUNCTION" python3 -c "import json,os,sys; print(json.load(sys.stdin)[os.environ['FN']])")
+            echo "::group::$FUNCTION"
+            echo "Image: $IMAGE"
+
+            # Settle any in flight configuration change before writing new code.
+            aws lambda wait function-updated-v2 --function-name "$FUNCTION"
+
+            PUBLISH_FLAG=()
+            if [ "$PUBLISH_VERSION" = "true" ]; then
+              PUBLISH_FLAG=(--publish)
+            fi
+
+            aws lambda update-function-code \
+              --function-name "$FUNCTION" \
+              --image-uri "$IMAGE" \
+              "${PUBLISH_FLAG[@]}" \
+              --query '{Version: Version, CodeSha256: CodeSha256, LastModified: LastModified}' \
+              --output table
+
+            # Container image functions stay Pending while Lambda optimizes the image.
+            aws lambda wait function-updated-v2 --function-name "$FUNCTION"
+            echo "$FUNCTION is updated and active."
+            echo "::endgroup::"
+          done <<< "$FUNCTIONS"
+
+      - name: Smoke test
+        if: inputs.smoke-url != ''
+        env:
+          SMOKE_URL: ${{ inputs.smoke-url }}
+          EXPECTED_STATUS: ${{ inputs.smoke-expected-status }}
+          ATTEMPTS: ${{ inputs.smoke-attempts }}
+          DELAY_SECONDS: ${{ inputs.smoke-delay-seconds }}
+          SMOKE_HEADER: ${{ secrets.smoke-header }}
+        run: |
+          HEADER_ARGS=()
+          if [ -n "$SMOKE_HEADER" ]; then
+            HEADER_ARGS=(-H "$SMOKE_HEADER")
+          fi
+          for i in $(seq 1 "$ATTEMPTS"); do
+            CODE=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' \
+              "${HEADER_ARGS[@]}" "$SMOKE_URL" || echo "000")
+            echo "  Attempt $i/$ATTEMPTS - HTTP $CODE"
+            if [ "$CODE" = "$EXPECTED_STATUS" ]; then
+              echo "Smoke test passed."
+              exit 0
+            fi
+            sleep "$DELAY_SECONDS"
+          done
+          echo "Smoke test never returned HTTP $EXPECTED_STATUS."
+          exit 1

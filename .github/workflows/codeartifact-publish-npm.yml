@@ -1,0 +1,217 @@
+# Reusable publish of a shared TypeScript package to CodeArtifact.
+#
+# Idempotent: the name and version from package.json are looked up in the repository
+# first, and an existing version is skipped with a notice rather than failing. That
+# keeps a re-run of an already released tag green.
+#
+# Nothing in this file is estate specific. Domain, repository, domain owner and the
+# role ARN arrive from the calling repository.
+name: CodeArtifact Publish npm
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to set up."
+        type: string
+        required: false
+        default: "22"
+      working-directory:
+        description: "Directory holding package.json."
+        type: string
+        required: false
+        default: "."
+      package-manager:
+        description: "Package manager to use: npm or pnpm."
+        type: string
+        required: false
+        default: "npm"
+      build-command:
+        description: "Build command run before publishing. Empty skips the build."
+        type: string
+        required: false
+        default: "npm run build"
+      codeartifact-domain:
+        description: "CodeArtifact domain."
+        type: string
+        required: true
+      codeartifact-repository:
+        description: "CodeArtifact repository name."
+        type: string
+        required: true
+      aws-region:
+        description: "AWS region holding the CodeArtifact domain."
+        type: string
+        required: true
+      environment:
+        description: "GitHub Environment providing publish scoped variables and approvals."
+        type: string
+        required: false
+        default: ""
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC in the artifacts account, allowed to publish."
+        required: true
+      codeartifact-domain-owner:
+        description: "AWS account id that owns the CodeArtifact domain."
+        required: true
+    outputs:
+      package-name:
+        description: "The published package name."
+        value: ${{ jobs.publish.outputs.package-name }}
+      package-version:
+        description: "The published package version."
+        value: ${{ jobs.publish.outputs.package-version }}
+      published:
+        description: "true when this run uploaded the version, false when it already existed."
+        value: ${{ jobs.publish.outputs.published }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeartifact-publish-npm-${{ github.repository }}-${{ inputs.codeartifact-repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      package-name: ${{ steps.metadata.outputs.package-name }}
+      package-version: ${{ steps.metadata.outputs.package-version }}
+      published: ${{ steps.publish.outputs.published }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Read the package metadata
+        id: metadata
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+
+          with open("package.json", encoding="utf-8") as handle:
+              package = json.load(handle)
+
+          name = package["name"]
+          # CodeArtifact splits a scoped name into a namespace and a package name,
+          # so @webbpulse/foo is looked up as namespace webbpulse, package foo.
+          namespace = ""
+          bare = name
+          if name.startswith("@"):
+              namespace, bare = name[1:].split("/", 1)
+
+          print(f"package-name={name}")
+          print(f"package-namespace={namespace}")
+          print(f"package-bare-name={bare}")
+          print(f"package-version={package['version']}")
+          PY
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Check whether the version already exists
+        id: exists
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          PACKAGE_BARE_NAME: ${{ steps.metadata.outputs.package-bare-name }}
+          PACKAGE_NAMESPACE: ${{ steps.metadata.outputs.package-namespace }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package-version }}
+        run: |
+          NAMESPACE_ARGS=()
+          if [ -n "$PACKAGE_NAMESPACE" ]; then
+            NAMESPACE_ARGS=(--namespace "$PACKAGE_NAMESPACE")
+          fi
+          # describe-package-version returns ResourceNotFoundException for an unknown
+          # package or version, which is the normal first publish path.
+          if aws codeartifact describe-package-version \
+              --domain "$CODEARTIFACT_DOMAIN" \
+              --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+              --repository "$CODEARTIFACT_REPOSITORY" \
+              --format npm \
+              --package "$PACKAGE_BARE_NAME" \
+              "${NAMESPACE_ARGS[@]}" \
+              --package-version "$PACKAGE_VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip the publish
+        if: steps.exists.outputs.exists == 'true'
+        env:
+          PACKAGE_NAME: ${{ steps.metadata.outputs.package-name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package-version }}
+        run: |
+          echo "::notice title=Publish skipped::${PACKAGE_NAME} ${PACKAGE_VERSION} is already in CodeArtifact."
+          echo "${PACKAGE_NAME} ${PACKAGE_VERSION} was already published. Nothing to do." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to CodeArtifact for npm
+        if: steps.exists.outputs.exists != 'true'
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          aws codeartifact login \
+            --tool npm \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Install dependencies
+        if: steps.exists.outputs.exists != 'true'
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          else
+            npm ci --no-progress
+          fi
+
+      - name: Build
+        if: steps.exists.outputs.exists != 'true' && inputs.build-command != ''
+        run: ${{ inputs.build-command }}
+
+      - name: Publish to CodeArtifact
+        id: publish
+        env:
+          ALREADY_EXISTS: ${{ steps.exists.outputs.exists }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.package-name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package-version }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          set -euo pipefail
+          if [ "$ALREADY_EXISTS" = "true" ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          npm publish --no-progress
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "Published ${PACKAGE_NAME} ${PACKAGE_VERSION} to ${CODEARTIFACT_REPOSITORY}." >> "$GITHUB_STEP_SUMMARY"
