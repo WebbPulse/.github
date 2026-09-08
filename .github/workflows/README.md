@@ -402,7 +402,9 @@ jobs:
 
 ## `spa-deploy.yml`
 
-Builds the frontend, syncs to S3 in two passes, and invalidates CloudFront.
+Builds the frontend, syncs to S3 in three passes, and invalidates CloudFront. An
+optional CodeArtifact npm login runs before the install, and an optional HCP Terraform
+wait runs before the sync.
 
 Three passes, in this order, so a deploy is never briefly broken:
 
@@ -427,6 +429,25 @@ because a new build gives them new keys. `invalidation-paths` appends extra path
 `/*` invalidates everything. The invalidation then waits for completion so the job does
 not report success before the edge is serving the build.
 
+**Waiting for HCP Terraform.** A Terraform apply that touches the same bucket or
+distribution can land in the middle of the sync. Set `tfc-organization` and
+`tfc-workspace` and pass the `tfc-api-token` secret, and the deploy polls the
+workspace's most recent run and holds until it reaches a terminal status (`applied`,
+`planned_and_finished`, `discarded`, `errored`, `canceled`, `force_canceled`) or the
+workspace has no runs at all. Both the workspace input and the token gate the step, so
+a repository that sets neither, or sets the workspace before the token is in place,
+deploys exactly as it did before. `tfc-wait-attempts` and `tfc-wait-interval-seconds`
+tune the poll; the defaults give ten minutes, after which the job fails rather than
+racing the apply.
+
+**Private packages.** A frontend that imports the shared `@webbpulse/*` packages needs
+`codeartifact-domain`, `codeartifact-repository` and the `codeartifact-domain-owner`
+secret. The login runs from the repository root, before the install, so `npm ci`
+resolves the scoped packages. Setting `codeartifact-domain` also moves the OIDC role
+assumption ahead of the install, since the login needs credentials; the single session
+then carries through to the S3 and CloudFront steps. Leave `codeartifact-domain` empty
+and the role is assumed after the build, exactly as before.
+
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `node-version` | string | `22` | |
@@ -446,10 +467,18 @@ not report success before the edge is serving the build.
 | `environment` | string | `""` | GitHub Environment. |
 | `concurrency-group` | string | `""` | Defaults to workflow plus ref. |
 | `runs-on` | string | `ubuntu-latest` | |
+| `codeartifact-domain` | string | `""` | Non empty enables the npm login before the install. |
+| `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`, validated at run time. |
+| `tfc-organization` | string | `""` | Required with `tfc-workspace`, validated at run time. |
+| `tfc-workspace` | string | `""` | Empty skips the wait. |
+| `tfc-wait-attempts` | number | `40` | Polls before the job gives up. |
+| `tfc-wait-interval-seconds` | number | `15` | Seconds between polls. |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
 | `role-to-assume` | yes | Writes the bucket and invalidates the distribution. |
+| `codeartifact-domain-owner` | no | Account id owning the domain. Required with `codeartifact-domain`. |
+| `tfc-api-token` | no | HCP Terraform API token. Unset skips the wait. |
 
 Outputs: none.
 
@@ -465,10 +494,16 @@ jobs:
       s3-bucket: ${{ vars.FRONTEND_S3_BUCKET }}
       cloudfront-distribution-id: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
       aws-region: ${{ vars.AWS_REGION }}
+      tfc-organization: ${{ vars.TFC_ORGANIZATION }}
+      tfc-workspace: ${{ vars.TFC_WORKSPACE }}
+      codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
+      codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
       build-env-json: >-
         {"VITE_API_BASE_URL": "${{ vars.API_BASE_URL }}"}
     secrets:
       role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+      codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
+      tfc-api-token: ${{ secrets.TFC_API_TOKEN }}
 ```
 
 ---
