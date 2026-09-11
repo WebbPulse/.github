@@ -120,6 +120,16 @@ on:
         type: string
         required: false
         default: ""
+      codeartifact-namespace:
+        description: >-
+          Optional npm scope to bind to CodeArtifact, for example @webbpulse. Set it and
+          only that scope resolves through CodeArtifact while everything else keeps going
+          to the public registry. Leave it empty and CodeArtifact becomes the default
+          registry for every package, which still resolves because the repository proxies
+          its upstream, but routes all public traffic through CodeArtifact.
+        type: string
+        required: false
+        default: ""
       tfc-organization:
         description: >-
           HCP Terraform organization owning the workspace to wait on. Required when
@@ -231,13 +241,19 @@ jobs:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
           CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_NAMESPACE: ${{ inputs.codeartifact-namespace }}
         run: |
           set -euo pipefail
+          NAMESPACE_ARGS=()
+          if [ -n "$CODEARTIFACT_NAMESPACE" ]; then
+            NAMESPACE_ARGS=(--namespace "$CODEARTIFACT_NAMESPACE")
+          fi
           aws codeartifact login \
             --tool npm \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY"
+            --repository "$CODEARTIFACT_REPOSITORY" \
+            "${NAMESPACE_ARGS[@]}"
 
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
