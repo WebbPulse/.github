@@ -1,11 +1,3 @@
-# Reusable publish of a shared Python package to CodeArtifact.
-#
-# Idempotent: the version in the built distribution is looked up in the repository
-# first, and an existing version is skipped with a notice rather than failing. That
-# keeps a re-run of an already released tag green.
-#
-# Nothing in this file is estate specific. Domain, repository, domain owner and the
-# role ARN arrive from the calling repository.
 name: CodeArtifact Publish Python
 
 on:
@@ -70,6 +62,7 @@ concurrency:
 
 jobs:
   publish:
+    name: Publish to CodeArtifact
     runs-on: ${{ inputs.runs-on }}
     environment: ${{ inputs.environment }}
     permissions:
@@ -86,8 +79,6 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No step in this workflow uses the checkout token afterwards, so the
-          # credentials are not left behind in .git/config for later steps to reuse.
           persist-credentials: false
 
       - name: Set up Python
@@ -112,8 +103,6 @@ jobs:
           if not wheels:
               raise SystemExit("No wheel was produced in dist/.")
 
-          # Wheel filenames are name-version-pythontag-abitag-platformtag.whl and the
-          # name and version carry no hyphens, per PEP 427 escaping.
           name, version = wheels[0].name.split("-")[:2]
           normalized = re.sub(r"[-_.]+", "-", name).lower()
           print(f"package-name={normalized}")
@@ -135,11 +124,6 @@ jobs:
           PACKAGE_NAME: ${{ steps.metadata.outputs.package-name }}
           PACKAGE_VERSION: ${{ steps.metadata.outputs.package-version }}
         run: |
-          # describe-package-version returns ResourceNotFoundException for an unknown
-          # package or version, which is the normal first publish path.
-          # Only ResourceNotFoundException means "not published yet". Any other failure
-          # (denied, throttled, wrong repository) must stop the job rather than be read as
-          # "absent" and turned into a doomed publish attempt.
           set +e
           ERR=$(aws codeartifact describe-package-version \
               --domain "$CODEARTIFACT_DOMAIN" \
@@ -185,8 +169,6 @@ jobs:
             exit 0
           fi
 
-          # login --tool twine writes the repository URL and credentials into
-          # ~/.pypirc under a profile named after the CodeArtifact repository.
           aws codeartifact login \
             --tool twine \
             --domain "$CODEARTIFACT_DOMAIN" \

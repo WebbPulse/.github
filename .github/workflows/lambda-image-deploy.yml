@@ -1,11 +1,3 @@
-# Reusable Lambda deploy for container image functions.
-#
-# Point one or many functions at an image URI, wait for each update to settle, then
-# optionally probe a smoke URL. Callers pass either a single function name plus a
-# single image URI, or a JSON object mapping function name to image URI.
-#
-# Nothing in this file is estate specific. Function names, image URIs, the role ARN
-# and the smoke URL all arrive from the calling repository.
 name: Lambda Image Deploy
 
 on:
@@ -87,6 +79,7 @@ concurrency:
 
 jobs:
   deploy:
+    name: Deploy the function image
     runs-on: ${{ inputs.runs-on }}
     environment: ${{ inputs.environment }}
     permissions:
@@ -145,11 +138,6 @@ jobs:
             echo "::group::$FUNCTION"
             echo "Image: $IMAGE"
 
-            # Settle any in flight configuration change before writing new code.
-            # While LastUpdateStatus is InProgress the Lambda documentation states
-            # that UpdateFunctionCode, UpdateFunctionConfiguration and PublishVersion
-            # all fail, so this wait is what keeps a deploy from colliding with a
-            # Terraform apply that is still writing function configuration.
             aws lambda wait function-updated-v2 --function-name "$FUNCTION"
 
             PUBLISH_FLAG=()
@@ -157,10 +145,6 @@ jobs:
               PUBLISH_FLAG=(--publish)
             fi
 
-            # The wait above closes most of the window, but a Terraform apply can
-            # start a new configuration update in the gap between the wait returning
-            # and the call below landing. That surfaces as ResourceConflictException,
-            # so retry it rather than failing the deploy. Any other error is fatal.
             ATTEMPT=1
             MAX_ATTEMPTS=6
             while true; do
@@ -199,7 +183,6 @@ jobs:
               esac
             done
 
-            # Container image functions stay Pending while Lambda optimizes the image.
             aws lambda wait function-updated-v2 --function-name "$FUNCTION"
             echo "$FUNCTION is updated and active."
             echo "::endgroup::"

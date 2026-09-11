@@ -1,7 +1,3 @@
-# Reusable TypeScript / Vite CI for WebbPulse frontends and shared packages.
-#
-# Nothing in this file is estate specific. Every account id, ARN, domain owner and
-# repository name arrives from the calling repository as an input or a secret.
 name: TypeScript CI
 
 on:
@@ -24,10 +20,8 @@ on:
         default: "npm"
       cache-dependency-path:
         description: >-
-          Lockfile path for the setup-node cache, relative to the repository root.
-          Empty derives <working-directory>/package-lock.json, or pnpm-lock.yaml for
-          pnpm. A workspaces monorepo keeps its only lockfile at the repository root,
-          so pass "package-lock.json" there.
+          Lockfile path for the setup-node cache, relative to the repository root. Empty
+          derives it from working-directory; a workspaces monorepo passes "package-lock.json".
         type: string
         required: false
         default: ""
@@ -114,10 +108,10 @@ permissions:
 
 jobs:
   typescript-ci:
+    name: Lint, type check, test and build
     runs-on: ${{ inputs.runs-on }}
     permissions:
       contents: read
-      # Needed only for the optional CodeArtifact login. Harmless when unused.
       id-token: write
     defaults:
       run:
@@ -126,8 +120,6 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No step in this workflow uses the checkout token afterwards, so the
-          # credentials are not left behind in .git/config for later steps to reuse.
           persist-credentials: false
 
       - name: Set up Node.js
@@ -137,13 +129,6 @@ jobs:
           cache: ${{ inputs.package-manager }}
           cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/{1}', inputs.working-directory, inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json') }}
 
-      # CodeArtifact hosts the shared WebbPulse TypeScript packages. The npm login
-      # writes the registry and auth token into ~/.npmrc, so it has to run before the
-      # install step. GetAuthorizationToken needs both codeartifact:GetAuthorizationToken
-      # and sts:GetServiceBearerToken on the assumed role.
-      # aws-region is a required input on configure-aws-credentials, and
-      # codeartifact-repository is required by the login below, so fail with a clear
-      # message here rather than an opaque action error further down.
       - name: Validate the CodeArtifact inputs
         if: inputs.codeartifact-domain != ''
         env:
@@ -209,9 +194,6 @@ jobs:
         if: inputs.test-command != ''
         run: ${{ inputs.test-command }}
 
-      # Caller supplied build variables, for example the Vite VITE_ values the two
-      # apps pass today. Written with the multiline delimiter form so values
-      # containing newlines or equals signs survive intact.
       - name: Apply the build environment
         if: inputs.build-command != ''
         env:
@@ -235,6 +217,7 @@ jobs:
         run: ${{ inputs.build-command }}
 
   playwright:
+    name: Playwright end to end tests
     if: inputs.run-playwright
     runs-on: ${{ inputs.runs-on }}
     permissions:
@@ -246,8 +229,6 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No step in this workflow uses the checkout token afterwards, so the
-          # credentials are not left behind in .git/config for later steps to reuse.
           persist-credentials: false
 
       - name: Set up Node.js
@@ -286,17 +267,6 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # The one stable name for a branch ruleset to require, matching `python-ci.yml`.
-  #
-  # `playwright` is conditional on an input, so requiring it directly would block every
-  # caller that does not run end to end tests. This job depends on both and reports one
-  # name regardless of which ran.
-  #
-  # `skipped` counts as success on purpose: a job skipped by its `if` is a job the caller
-  # did not ask for, and a docs-only pull request whose path filter skipped the build must
-  # not be blocked by a check that never had anything to do. Failure and cancellation both
-  # fail the gate, cancellation because a cancelled job has proven nothing and treating it
-  # as success would let a run cancelled mid-flight satisfy the ruleset.
   all-checks-passed:
     name: all-checks-passed
     runs-on: ${{ inputs.runs-on }}

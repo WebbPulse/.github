@@ -1,15 +1,3 @@
-# Reusable Python CI for WebbPulse backend services.
-#
-# Nothing in this file is estate specific. Every account id, ARN, domain owner and
-# repository name arrives from the calling repository as an input or a secret.
-#
-# Shape: lint, type check and security each run once, while pytest fans out into one
-# job per domain plus a `shared` job carrying everything no domain claims. Wall clock
-# time therefore tracks the largest domain rather than the sum of every domain, which
-# is what makes testing speed scale with the number of domains rather than degrade
-# with it. `all-checks-passed` at the end is the single stable context a branch
-# ruleset requires; see the comment on that job for why the matrix job names cannot
-# be required directly.
 name: Python CI
 
 on:
@@ -32,9 +20,8 @@ on:
         default: "python -m pip install --upgrade pip && pip install -r requirements-dev.txt"
       cache-dependency-path:
         description: >-
-          Dependency file glob for the setup-python pip cache, relative to the repository
-          root. Empty derives every requirements*.txt and pyproject.toml under
-          working-directory, which is right for both project shapes in the estate.
+          Dependency file glob for the setup-python pip cache. Empty derives every
+          requirements*.txt and pyproject.toml under working-directory.
         type: string
         required: false
         default: ""
@@ -45,9 +32,7 @@ on:
         default: "."
       lint-commands:
         description: >-
-          Extra lint or format commands, one per line, run inside working-directory in the
-          lint job after ruff. For a repository whose tool list predates ruff, for example
-          `black --check .` and `isort . --check-only`.
+          Extra lint or format commands, one per line, run in working-directory after ruff.
         type: string
         required: false
         default: ""
@@ -65,9 +50,8 @@ on:
         default: ""
       pytest-args:
         description: >-
-          Extra arguments appended to every pytest invocation, after the per-domain path
-          arguments. Do not put paths here when domains are declared: the domain
-          configuration supplies them and a path here would be added to every job.
+          Extra arguments appended to every pytest invocation. Never paths when domains are
+          declared, since those would apply to every job.
         type: string
         required: false
         default: ""
@@ -85,9 +69,8 @@ on:
         default: "app"
       test-env-json:
         description: >-
-          JSON object of environment variables exported before pytest, for settings a suite
-          needs to import at all. Not for secrets: this is an input, so it is visible in the
-          run log.
+          JSON object of environment variables exported before pytest. Not for secrets, which
+          would be visible in the run log.
         type: string
         required: false
         default: "{}"
@@ -123,17 +106,6 @@ permissions:
   contents: read
 
 jobs:
-  # Reads [tool.webbpulse.ci.domains] from the caller's pyproject.toml and emits the
-  # matrix. Deliberately a bare interpreter with no install: `webbpulse.ci` imports only
-  # the standard library precisely so this job costs seconds rather than an install, and
-  # so the matrix is known before any dependency resolution can fail.
-  #
-  # The table is read inline rather than through the installed `webbpulse.ci`. A caller
-  # whose dependencies come from CodeArtifact cannot install anything here without an AWS
-  # role, and requiring one just to read a TOML table would make this the most privileged
-  # job in the workflow. `webbpulse.ci` remains the documented contract and the place the
-  # convention is specified and tested; this is the same table read with the same rules,
-  # kept deliberately small so the two cannot drift far.
   discover:
     name: Discover domains
     runs-on: ${{ inputs.runs-on }}
@@ -156,7 +128,6 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          # tomllib is standard library from 3.11, so this needs nothing installed.
           DOMAINS=$(python3 - <<'PY'
           import json
           import pathlib
@@ -195,9 +166,6 @@ jobs:
             echo "Domains: $DOMAINS"
           fi
 
-  # Ruff, plus any extra lint commands a repository has not converged off yet. Runs once
-  # for the whole repository rather than per domain: linting the same files nine times
-  # would spend nine runners to learn one thing.
   lint:
     name: Lint
     if: inputs.ruff-target != '' || inputs.lint-commands != ''
@@ -252,8 +220,6 @@ jobs:
         if: inputs.ruff-target != ''
         run: ruff format --check --diff ${{ inputs.ruff-target }}
 
-      # Each line is run separately so the step summary names the tool that failed
-      # rather than reporting a single opaque non-zero exit for the whole block.
       - name: Extra lint commands
         if: inputs.lint-commands != ''
         env:
@@ -374,13 +340,6 @@ jobs:
             echo "::endgroup::"
           done <<< "$SECURITY_COMMANDS"
 
-  # One job per declared domain. Skipped entirely when a repository declares none, in
-  # which case `shared` below carries the whole suite and this workflow behaves exactly
-  # as it did before the split.
-  #
-  # fail-fast is off so a pull request touching two domains gets both verdicts in one
-  # run. Reporting the first failure and cancelling the rest would make a two-domain
-  # break take two runs to diagnose, which is the opposite of the point.
   domain-tests:
     name: Tests (${{ matrix.domain }})
     needs: discover
@@ -455,9 +414,6 @@ jobs:
           PYTEST_WORKERS: ${{ inputs.pytest-workers }}
         run: |
           set -euo pipefail
-          # Resolve the paths from the same table `discover` read. Inline rather than via
-          # the installed `webbpulse.ci` so the two cannot disagree about the contract,
-          # and so this works before the package is on the path.
           PATHS=$(python3 - <<'PY'
           import os
           import shlex
@@ -477,13 +433,6 @@ jobs:
           PY
           )
           echo "Running: $PATHS"
-          # Coverage is collected per domain but not gated per domain: a domain job sees
-          # only its own tests, so any per-job threshold would measure the wrong thing.
-          # The artifacts are uploaded and the shared job prints the summary.
-          # `-n` is xdist's flag, and pytest rejects an unknown argument outright rather
-          # than ignoring it. A caller who has not added pytest-xdist would otherwise get
-          # `unrecognized arguments: -n` from a flag they never wrote, so drop it and say
-          # why instead of failing on the workflow's own default.
           if [ -n "${PYTEST_WORKERS:-}" ] && ! python -c 'import xdist' 2>/dev/null; then
             echo "::warning::pytest-xdist is not installed, so tests run single process. Add it to this project's dev dependencies to use pytest-workers."
             PYTEST_WORKERS=""
@@ -507,10 +456,6 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # Everything the declared domains do not claim. Computed as a deselection rather than
-  # as a list, so a test file nobody remembered to claim runs here instead of silently
-  # not running at all. When no domains are declared this is simply the whole suite,
-  # which is the pre-split behaviour.
   shared-tests:
     name: Tests (shared)
     needs: discover
@@ -598,10 +543,6 @@ jobs:
           PY
           )
           echo "Running: $PATHS"
-          # `-n` is xdist's flag, and pytest rejects an unknown argument outright rather
-          # than ignoring it. A caller who has not added pytest-xdist would otherwise get
-          # `unrecognized arguments: -n` from a flag they never wrote, so drop it and say
-          # why instead of failing on the workflow's own default.
           if [ -n "${PYTEST_WORKERS:-}" ] && ! python -c 'import xdist' 2>/dev/null; then
             echo "::warning::pytest-xdist is not installed, so tests run single process. Add it to this project's dev dependencies to use pytest-workers."
             PYTEST_WORKERS=""
@@ -649,20 +590,6 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # The one stable name for a branch ruleset to require.
-  #
-  # The matrix job names carry a domain and change whenever a domain is added or removed,
-  # and a required context that no longer exists blocks every pull request until someone
-  # edits the ruleset. The lint, type check and security jobs are conditional on inputs,
-  # so requiring them directly would break for a caller that does not pass those. This
-  # job depends on all of them and reports one name regardless.
-  #
-  # `skipped` is treated as success on purpose, and that is the difference from a naive
-  # gate. A job skipped by its `if` is a job the caller did not ask for, and a caller that
-  # passes no `typecheck-command` must not be blocked by a type check that never ran.
-  # Failure and cancellation both fail the gate; cancellation matters because a cancelled
-  # job has not proven anything, and treating it as success would let a run cancelled
-  # mid-flight satisfy the ruleset.
   all-checks-passed:
     name: all-checks-passed
     runs-on: ${{ inputs.runs-on }}
