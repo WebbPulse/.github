@@ -105,7 +105,7 @@ naming a context that no longer exists, blocking every pull request until someon
 | `typecheck-command` | string | `""` | Empty skips the type check job. |
 | `security-commands` | string | `""` | Security scans, one per line. Empty skips the job. |
 | `pytest-args` | string | `""` | Appended to every pytest run. **Not for paths** when domains are declared. |
-| `pytest-workers` | string | `auto` | Value for xdist `-n`. Empty omits `-n` for a suite that is not xdist safe. |
+| `pytest-workers` | string | `auto` | Value for xdist `-n`. Empty omits `-n` for a suite that is not xdist safe. Needs `pytest-xdist` in the project's dev dependencies; without it the flag is dropped and the job logs a warning. |
 | `coverage-source` | string | `app` | Package measured by coverage. |
 | `test-env-json` | string | `{}` | Env vars exported before pytest. Not for secrets: inputs appear in the log. |
 | `runs-on` | string | `ubuntu-latest` | Runner label. |
