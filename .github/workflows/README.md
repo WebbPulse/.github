@@ -29,23 +29,89 @@ carry a `concurrency` group so two runs never overlap on one target.
 
 ## `python-ci.yml`
 
-Checkout, Python setup with pip cache, install, `ruff check`, `ruff format --check`,
-and pytest with a coverage summary written to the job summary. An optional
-CodeArtifact pip login runs first when `codeartifact-domain` is non empty, so shared
-private packages resolve during the install.
+Lint, type check and security each run once. Pytest fans out into **one job per domain**
+plus a `shared` job carrying everything no domain claims, so wall clock time tracks the
+largest domain rather than the sum of every domain. A final `all-checks-passed` job is the
+single stable context a branch ruleset requires.
+
+An optional CodeArtifact pip login runs before the install in every job that installs, so
+shared private packages resolve.
+
+### Jobs
+
+| Job | Runs when | Notes |
+| --- | --- | --- |
+| `Discover domains` | always | Reads `[tool.webbpulse.ci.domains]` in a bare interpreter, no install. |
+| `Lint` | `ruff-target` or `lint-commands` non empty | `ruff check`, `ruff format --check`, then each extra command. |
+| `Type check` | `typecheck-command` non empty | |
+| `Security` | `security-commands` non empty | |
+| `Tests (<domain>)` | one per declared domain | `fail-fast: false`, so a two-domain break needs one run, not two. |
+| `Tests (shared)` | always | Everything no domain claims. Whole suite when none are declared. |
+| `all-checks-passed` | always | The context to require. See [Merging: auto-merge on green](#merging-auto-merge-on-green). |
+
+### Declaring domains
+
+The convention lives in the **calling repository's** `pyproject.toml`, so adding a domain to
+CI is adding a line rather than editing a workflow. It is specified, documented and tested in
+the shared [`webbpulse`](https://github.com/WebbPulse/webbpulse-python) package as
+`webbpulse.ci` (0.18.0 and later):
+
+```toml
+[tool.webbpulse.ci]
+# Directory the `shared` job sweeps. Defaults to "tests".
+test-root = "tests"
+
+[tool.webbpulse.ci.domains]
+identity = ["tests/auth", "tests/dependencies"]
+catalog  = ["tests/api/endpoints/test_parts.py", "tests/api/endpoints/test_categories.py"]
+```
+
+Paths are relative to `working-directory`, so they reach pytest unchanged. A value may name
+a **directory or a single test file**: a suite not yet split by directory still has to be
+splittable, and requiring the files to move first would make adoption a refactor rather than
+a configuration change.
+
+**`shared` is a deselection, not a list.** It runs `test-root` with an `--ignore` for every
+claimed path. So the jobs together run each test exactly once, and a new test file is covered
+the moment it is written. Forgetting to claim a file makes it run in `shared`, which is slower
+but never silent, and that is the right direction for the mistake to fall.
+
+`shared` is reserved and cannot be a domain name; a domain claiming no paths is rejected,
+because its job would run pytest with no paths and collect the whole suite.
+
+A repository with no such table gets no domain jobs and a `shared` job carrying everything,
+which is exactly the pre-split behaviour. The workflow can therefore be called unconditionally.
+
+### Adding a domain
+
+1. Add one line under `[tool.webbpulse.ci.domains]` naming the paths it owns.
+2. Open the pull request. `Discover domains` picks it up and a `Tests (<name>)` job appears.
+
+No workflow edit, and **no ruleset edit**: the required context is `all-checks-passed`, which
+does not change when the matrix does. That is the whole reason the gate exists rather than
+requiring the matrix jobs directly, whose names carry a domain and would leave the ruleset
+naming a context that no longer exists, blocking every pull request until someone fixed it.
+
+### Inputs
 
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `python-version` | string | `3.13` | Matches the estate's backends. |
-| `working-directory` | string | `backend` | Directory holding the project. |
+| `working-directory` | string | `backend` | Directory holding `pyproject.toml`. |
 | `install-command` | string | `python -m pip install --upgrade pip && pip install -r requirements-dev.txt` | Swap for `uv sync` if a repo moves to uv. |
-| `ruff-target` | string | `.` | Paths passed to ruff. |
-| `pytest-args` | string | `""` | Extra pytest arguments. |
+| `cache-dependency-path` | string | `""` | pip cache key. Empty derives `<working-directory>/requirements*.txt` and `pyproject.toml`. |
+| `ruff-target` | string | `.` | Paths for ruff. Empty skips both ruff steps. |
+| `lint-commands` | string | `""` | Extra lint commands, one per line, for a tool list that predates ruff. |
+| `typecheck-command` | string | `""` | Empty skips the type check job. |
+| `security-commands` | string | `""` | Security scans, one per line. Empty skips the job. |
+| `pytest-args` | string | `""` | Appended to every pytest run. **Not for paths** when domains are declared. |
+| `pytest-workers` | string | `auto` | Value for xdist `-n`. Empty omits `-n` for a suite that is not xdist safe. |
 | `coverage-source` | string | `app` | Package measured by coverage. |
+| `test-env-json` | string | `{}` | Env vars exported before pytest. Not for secrets: inputs appear in the log. |
 | `runs-on` | string | `ubuntu-latest` | Runner label. |
 | `codeartifact-domain` | string | `""` | Non empty enables the CodeArtifact login. |
-| `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`, and validated at run time. |
-| `aws-region` | string | `""` | Required with `codeartifact-domain`, and validated at run time. |
+| `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`, validated at run time. |
+| `aws-region` | string | `""` | Required with `codeartifact-domain`, validated at run time. |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
@@ -54,17 +120,27 @@ private packages resolve during the install.
 
 Outputs: none.
 
+Coverage is collected per job and uploaded as an artifact per domain. It is **not** gated per
+domain: a domain job sees only its own tests, so any per-job threshold would measure the wrong
+thing. The `shared` job writes the coverage summary, labelled as the floor it is.
+
 ```yaml
 jobs:
   backend-ci:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v1
+    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v2
     with:
       working-directory: backend
       coverage-source: app
+      typecheck-command: pyright
+      security-commands: |
+        bandit -r app -ll
+        pip-audit -r requirements.txt
 ```
+
+---
 
 ---
 
@@ -73,7 +149,8 @@ jobs:
 Node setup with the package manager cache, install, lint, format check, typecheck,
 unit tests, and build. An optional CodeArtifact npm login runs before the install.
 A second `playwright` job runs only when `run-playwright` is true, and uploads the
-report as an artifact.
+report as an artifact. A final `all-checks-passed` job gates both, and is the context
+a branch ruleset requires. See [Merging: auto-merge on green](#merging-auto-merge-on-green).
 
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -680,6 +757,66 @@ jobs:
 
 ---
 
+## Merging: auto-merge on green
+
+Every repository in the organisation has `allow_auto_merge` and `delete_branch_on_merge`
+turned on. The intended flow is to queue the merge when the pull request is opened and let
+CI decide:
+
+```bash
+# Every repository except WebbPulse-Portfolio
+gh pr merge <number> --auto --squash
+
+# WebbPulse-Portfolio, which keeps merge commits
+gh pr merge <number> --auto --merge
+```
+
+GitHub then merges the pull request by itself the moment every required check is green and
+the branch is mergeable, and deletes the branch afterwards.
+
+**Auto-merge is only as safe as the required checks.** With none required, "mergeable" means
+nothing more than the absence of a conflict, so auto-merge would merge a pull request whose
+tests had not finished, or had failed. That is why each repository's `main-protection` (and
+`staging-protection`, where it exists) ruleset requires exactly one status check:
+
+```
+all-checks-passed
+```
+
+That name is reported by a final job in the reusable CI workflows, which `needs` every other
+job, runs with `if: always()`, and fails when any needed job's result is `failure` or
+`cancelled`.
+
+**`skipped` counts as success, deliberately.** A job skipped by its `if` is a job nobody asked
+for: a caller that passes no `typecheck-command`, or a docs-only pull request whose path
+filter skipped the build. Failing on `skipped` would block those pull requests on a check that
+never had anything to do. Cancellation is a failure, because a cancelled job has proven
+nothing and treating it as success would let a run cancelled mid-flight satisfy the ruleset.
+
+**One gate per repository, not per workflow.** A required context must be reported on *every*
+pull request or the pull request waits for it forever. Two shapes satisfy that:
+
+1. **One `ci.yml`** on `pull_request` with no workflow-level `paths:` filter, calling each
+   reusable workflow as a job and ending with the repository's own `all-checks-passed`. Path
+   filtering moves inside, as a `dorny/paths-filter` step or a changed-files check, so the
+   jobs skip but the gate still reports. This is the shape to prefer.
+2. **Separate workflows**, each of which must then run on every pull request with no
+   workflow-level `paths:` filter, for the same reason. Only one may own the
+   `all-checks-passed` name, or the context becomes ambiguous.
+
+The failure mode of getting this wrong is quiet and total: a pull request that touches only
+`docs/` never triggers the workflow, the required context is never reported, and the pull
+request sits pending forever with auto-merge armed and nothing to tell you why.
+
+### Adding a domain does not touch the ruleset
+
+The required context is `all-checks-passed`, not the matrix job names. Those carry a domain
+and change whenever one is added or removed; a required context naming a job that no longer
+exists blocks every pull request until someone edits the ruleset. The gate is what makes
+adding a domain a one-line change to `pyproject.toml`.
+
+---
+
 ## Releasing and what callers pin to
 
 Callers must pin to a **tag or a commit SHA of this repository**, never to `@main`.
@@ -710,8 +847,28 @@ comment, exactly as this repository pins third party actions:
 uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v1.4.0
 ```
 
-Both forms are fine. `@v1` is the default; pin a SHA where a repository needs a
+Both forms are fine. `@v2` is the current default; pin a SHA where a repository needs a
 change to this repository to be an explicit, reviewed event.
+
+### v1 to v2
+
+`v2` split `python-ci.yml` from one `python-ci` job into `discover`, `lint`, `typecheck`,
+`security`, a `Tests (<domain>)` matrix, `Tests (shared)` and `all-checks-passed`, and added
+`all-checks-passed` to `typescript-ci.yml`. Every input `v1` accepted still means the same
+thing, so most callers migrate by changing `@v1` to `@v2` and nothing else.
+
+It is a major bump because the **job names changed**. A ruleset or branch protection naming
+`python-ci` as a required context, or a workflow whose `needs:` referenced that job, has to
+move to `all-checks-passed`. `v1` stops moving and remains available for a caller that is not
+ready.
+
+Two things are worth doing at the same time as the bump, though neither is required:
+
+- Declare `[tool.webbpulse.ci.domains]` in the caller's `pyproject.toml`. Without it the
+  whole suite runs in `Tests (shared)`, exactly as it did under `v1`.
+- Move a `typecheck` or `bandit`/`pip-audit` step out of a hand written job and into
+  `typecheck-command` and `security-commands`, so they run in parallel with the tests rather
+  than in series before them.
 
 ---
 

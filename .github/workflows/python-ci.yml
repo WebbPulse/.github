@@ -2,6 +2,14 @@
 #
 # Nothing in this file is estate specific. Every account id, ARN, domain owner and
 # repository name arrives from the calling repository as an input or a secret.
+#
+# Shape: lint, type check and security each run once, while pytest fans out into one
+# job per domain plus a `shared` job carrying everything no domain claims. Wall clock
+# time therefore tracks the largest domain rather than the sum of every domain, which
+# is what makes testing speed scale with the number of domains rather than degrade
+# with it. `all-checks-passed` at the end is the single stable context a branch
+# ruleset requires; see the comment on that job for why the matrix job names cannot
+# be required directly.
 name: Python CI
 
 on:
@@ -22,21 +30,67 @@ on:
         type: string
         required: false
         default: "python -m pip install --upgrade pip && pip install -r requirements-dev.txt"
-      ruff-target:
-        description: "Paths passed to ruff check and ruff format."
-        type: string
-        required: false
-        default: "."
-      pytest-args:
-        description: "Extra arguments appended to the pytest invocation."
+      cache-dependency-path:
+        description: >-
+          Dependency file glob for the setup-python pip cache, relative to the repository
+          root. Empty derives every requirements*.txt and pyproject.toml under
+          working-directory, which is right for both project shapes in the estate.
         type: string
         required: false
         default: ""
+      ruff-target:
+        description: "Paths passed to ruff check and ruff format. Empty skips both."
+        type: string
+        required: false
+        default: "."
+      lint-commands:
+        description: >-
+          Extra lint or format commands, one per line, run inside working-directory in the
+          lint job after ruff. For a repository whose tool list predates ruff, for example
+          `black --check .` and `isort . --check-only`.
+        type: string
+        required: false
+        default: ""
+      typecheck-command:
+        description: "Type check command, run in its own job. Empty skips the job."
+        type: string
+        required: false
+        default: ""
+      security-commands:
+        description: >-
+          Security scan commands, one per line, run in their own job. For example
+          `bandit -r app -ll` and `pip-audit -r requirements.txt`.
+        type: string
+        required: false
+        default: ""
+      pytest-args:
+        description: >-
+          Extra arguments appended to every pytest invocation, after the per-domain path
+          arguments. Do not put paths here when domains are declared: the domain
+          configuration supplies them and a path here would be added to every job.
+        type: string
+        required: false
+        default: ""
+      pytest-workers:
+        description: >-
+          Value for pytest-xdist's -n. `auto` matches the runner's core count. Set to an
+          empty string to omit -n entirely, for a suite that is not xdist safe.
+        type: string
+        required: false
+        default: "auto"
       coverage-source:
         description: "Package or directory measured by coverage."
         type: string
         required: false
         default: "app"
+      test-env-json:
+        description: >-
+          JSON object of environment variables exported before pytest, for settings a suite
+          needs to import at all. Not for secrets: this is an input, so it is visible in the
+          run log.
+        type: string
+        required: false
+        default: "{}"
       runs-on:
         description: "Runner label."
         type: string
@@ -69,11 +123,87 @@ permissions:
   contents: read
 
 jobs:
-  python-ci:
+  # Reads [tool.webbpulse.ci.domains] from the caller's pyproject.toml and emits the
+  # matrix. Deliberately a bare interpreter with no install: `webbpulse.ci` imports only
+  # the standard library precisely so this job costs seconds rather than an install, and
+  # so the matrix is known before any dependency resolution can fail.
+  #
+  # The table is read inline rather than through the installed `webbpulse.ci`. A caller
+  # whose dependencies come from CodeArtifact cannot install anything here without an AWS
+  # role, and requiring one just to read a TOML table would make this the most privileged
+  # job in the workflow. `webbpulse.ci` remains the documented contract and the place the
+  # convention is specified and tested; this is the same table read with the same rules,
+  # kept deliberately small so the two cannot drift far.
+  discover:
+    name: Discover domains
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      domains: ${{ steps.domains.outputs.domains }}
+      has-domains: ${{ steps.domains.outputs.has-domains }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - id: domains
+        name: Read the declared domains
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          # tomllib is standard library from 3.11, so this needs nothing installed.
+          DOMAINS=$(python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+          import tomllib
+
+          path = pathlib.Path("pyproject.toml")
+          if not path.is_file():
+              print("[]")
+              sys.exit(0)
+
+          with path.open("rb") as handle:
+              document = tomllib.load(handle)
+
+          table = document.get("tool", {}).get("webbpulse", {}).get("ci", {})
+          domains = table.get("domains", {})
+          if not isinstance(domains, dict):
+              print("[tool.webbpulse.ci.domains] must be a table", file=sys.stderr)
+              sys.exit(1)
+          if "shared" in domains:
+              print("'shared' is reserved for the job carrying unclaimed tests", file=sys.stderr)
+              sys.exit(1)
+          for name, paths in domains.items():
+              if not isinstance(paths, list) or not paths:
+                  print(f"domain {name!r} must claim a non-empty list of paths", file=sys.stderr)
+                  sys.exit(1)
+          print(json.dumps(sorted(domains)))
+          PY
+          )
+          echo "domains=$DOMAINS" >> "$GITHUB_OUTPUT"
+          if [ "$DOMAINS" = "[]" ]; then
+            echo "has-domains=false" >> "$GITHUB_OUTPUT"
+            echo "No domains declared. The shared job will carry the whole suite."
+          else
+            echo "has-domains=true" >> "$GITHUB_OUTPUT"
+            echo "Domains: $DOMAINS"
+          fi
+
+  # Ruff, plus any extra lint commands a repository has not converged off yet. Runs once
+  # for the whole repository rather than per domain: linting the same files nine times
+  # would spend nine runners to learn one thing.
+  lint:
+    name: Lint
+    if: inputs.ruff-target != '' || inputs.lint-commands != ''
     runs-on: ${{ inputs.runs-on }}
     permissions:
       contents: read
-      # Needed only for the optional CodeArtifact login. Harmless when unused.
       id-token: write
     defaults:
       run:
@@ -82,8 +212,6 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No step in this workflow uses the checkout token afterwards, so the
-          # credentials are not left behind in .git/config for later steps to reuse.
           persist-credentials: false
 
       - name: Set up Python
@@ -91,28 +219,7 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
           cache: pip
-
-      # CodeArtifact hosts the shared WebbPulse Python packages. GetAuthorizationToken
-      # needs both codeartifact:GetAuthorizationToken and sts:GetServiceBearerToken on
-      # the assumed role. The login writes an index-url into pip.conf, so it has to run
-      # before the install step.
-      # aws-region is a required input on configure-aws-credentials, and
-      # codeartifact-repository is required by the login below, so fail with a clear
-      # message here rather than an opaque action error further down.
-      - name: Validate the CodeArtifact inputs
-        if: inputs.codeartifact-domain != ''
-        env:
-          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
-          AWS_REGION_INPUT: ${{ inputs.aws-region }}
-        run: |
-          set -euo pipefail
-          MISSING=""
-          [ -n "$CODEARTIFACT_REPOSITORY" ] || MISSING="$MISSING codeartifact-repository"
-          [ -n "$AWS_REGION_INPUT" ] || MISSING="$MISSING aws-region"
-          if [ -n "$MISSING" ]; then
-            echo "codeartifact-domain is set, so these inputs are required too:$MISSING"
-            exit 1
-          fi
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
 
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
@@ -138,37 +245,422 @@ jobs:
         run: ${{ inputs.install-command }}
 
       - name: Ruff check
+        if: inputs.ruff-target != ''
         run: ruff check --output-format=github ${{ inputs.ruff-target }}
 
       - name: Ruff format check
+        if: inputs.ruff-target != ''
         run: ruff format --check --diff ${{ inputs.ruff-target }}
 
-      - name: Pytest with coverage
+      # Each line is run separately so the step summary names the tool that failed
+      # rather than reporting a single opaque non-zero exit for the whole block.
+      - name: Extra lint commands
+        if: inputs.lint-commands != ''
+        env:
+          LINT_COMMANDS: ${{ inputs.lint-commands }}
         run: |
-          python -m pytest \
+          set -euo pipefail
+          while IFS= read -r command; do
+            [ -n "${command// /}" ] || continue
+            echo "::group::$command"
+            eval "$command"
+            echo "::endgroup::"
+          done <<< "$LINT_COMMANDS"
+
+  typecheck:
+    name: Type check
+    if: inputs.typecheck-command != ''
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+
+      - name: Configure AWS credentials for CodeArtifact
+        if: inputs.codeartifact-domain != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to CodeArtifact for pip
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          aws codeartifact login \
+            --tool pip \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Type check
+        run: ${{ inputs.typecheck-command }}
+
+  security:
+    name: Security
+    if: inputs.security-commands != ''
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+
+      - name: Configure AWS credentials for CodeArtifact
+        if: inputs.codeartifact-domain != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to CodeArtifact for pip
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          aws codeartifact login \
+            --tool pip \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Security scans
+        env:
+          SECURITY_COMMANDS: ${{ inputs.security-commands }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r command; do
+            [ -n "${command// /}" ] || continue
+            echo "::group::$command"
+            eval "$command"
+            echo "::endgroup::"
+          done <<< "$SECURITY_COMMANDS"
+
+  # One job per declared domain. Skipped entirely when a repository declares none, in
+  # which case `shared` below carries the whole suite and this workflow behaves exactly
+  # as it did before the split.
+  #
+  # fail-fast is off so a pull request touching two domains gets both verdicts in one
+  # run. Reporting the first failure and cancelling the rest would make a two-domain
+  # break take two runs to diagnose, which is the opposite of the point.
+  domain-tests:
+    name: Tests (${{ matrix.domain }})
+    needs: discover
+    if: needs.discover.outputs.has-domains == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        domain: ${{ fromJson(needs.discover.outputs.domains) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+
+      - name: Configure AWS credentials for CodeArtifact
+        if: inputs.codeartifact-domain != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to CodeArtifact for pip
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          aws codeartifact login \
+            --tool pip \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Apply the test environment
+        env:
+          TEST_ENV_JSON: ${{ inputs.test-env-json }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import uuid
+
+          values = json.loads(os.environ["TEST_ENV_JSON"] or "{}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  delimiter = f"ghadelim_{uuid.uuid4().hex}"
+                  handle.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
+          print("Applied test environment keys: " + ", ".join(sorted(values)))
+          PY
+
+      - name: Pytest for this domain
+        env:
+          DOMAIN: ${{ matrix.domain }}
+          PYTEST_WORKERS: ${{ inputs.pytest-workers }}
+        run: |
+          set -euo pipefail
+          # Resolve the paths from the same table `discover` read. Inline rather than via
+          # the installed `webbpulse.ci` so the two cannot disagree about the contract,
+          # and so this works before the package is on the path.
+          PATHS=$(python3 - <<'PY'
+          import os
+          import shlex
+          import sys
+          import tomllib
+
+          with open("pyproject.toml", "rb") as handle:
+              table = tomllib.load(handle)["tool"]["webbpulse"]["ci"]
+
+          domains = table["domains"]
+          name = os.environ["DOMAIN"]
+          try:
+              print(" ".join(shlex.quote(p) for p in domains[name]))
+          except KeyError:
+              print(f"unknown domain {name!r}", file=sys.stderr)
+              sys.exit(1)
+          PY
+          )
+          echo "Running: $PATHS"
+          # Coverage is collected per domain but not gated per domain: a domain job sees
+          # only its own tests, so any per-job threshold would measure the wrong thing.
+          # The artifacts are uploaded and the shared job prints the summary.
+          eval "python -m pytest ${PYTEST_WORKERS:+-n \"$PYTEST_WORKERS\"} \
             --cov=${{ inputs.coverage-source }} \
             --cov-report=term-missing \
-            --cov-report=xml \
-            --junitxml=pytest-report.xml \
-            ${{ inputs.pytest-args }}
+            --cov-report=xml:coverage-$DOMAIN.xml \
+            --junitxml=pytest-$DOMAIN.xml \
+            --no-cov-on-fail \
+            $PATHS ${{ inputs.pytest-args }}"
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ matrix.domain }}
+          path: |
+            ${{ inputs.working-directory }}/coverage-${{ matrix.domain }}.xml
+            ${{ inputs.working-directory }}/pytest-${{ matrix.domain }}.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Everything the declared domains do not claim. Computed as a deselection rather than
+  # as a list, so a test file nobody remembered to claim runs here instead of silently
+  # not running at all. When no domains are declared this is simply the whole suite,
+  # which is the pre-split behaviour.
+  shared-tests:
+    name: Tests (shared)
+    needs: discover
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+
+      - name: Configure AWS credentials for CodeArtifact
+        if: inputs.codeartifact-domain != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to CodeArtifact for pip
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+        run: |
+          aws codeartifact login \
+            --tool pip \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Apply the test environment
+        env:
+          TEST_ENV_JSON: ${{ inputs.test-env-json }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import uuid
+
+          values = json.loads(os.environ["TEST_ENV_JSON"] or "{}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  delimiter = f"ghadelim_{uuid.uuid4().hex}"
+                  handle.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
+          print("Applied test environment keys: " + ", ".join(sorted(values)))
+          PY
+
+      - name: Pytest for everything no domain claims
+        env:
+          PYTEST_WORKERS: ${{ inputs.pytest-workers }}
+        run: |
+          set -euo pipefail
+          PATHS=$(python3 - <<'PY'
+          import pathlib
+          import shlex
+          import tomllib
+
+          table = {}
+          path = pathlib.Path("pyproject.toml")
+          if path.is_file():
+              with path.open("rb") as handle:
+                  document = tomllib.load(handle)
+              table = document.get("tool", {}).get("webbpulse", {}).get("ci", {})
+
+          test_root = table.get("test-root", "tests")
+          claimed = sorted({p for paths in table.get("domains", {}).values() for p in paths})
+          args = [test_root, *(f"--ignore={p}" for p in claimed)]
+          print(" ".join(shlex.quote(a) for a in args))
+          PY
+          )
+          echo "Running: $PATHS"
+          eval "python -m pytest ${PYTEST_WORKERS:+-n \"$PYTEST_WORKERS\"} \
+            --cov=${{ inputs.coverage-source }} \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-shared.xml \
+            --junitxml=pytest-shared.xml \
+            --no-cov-on-fail \
+            $PATHS ${{ inputs.pytest-args }}"
 
       - name: Coverage summary
         if: always()
         run: |
-          if [ ! -f coverage.xml ]; then
-            echo "No coverage.xml produced." >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f coverage-shared.xml ]; then
+            echo "No coverage report produced." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import xml.etree.ElementTree as ET
 
-          root = ET.parse("coverage.xml").getroot()
+          root = ET.parse("coverage-shared.xml").getroot()
           line_rate = float(root.get("line_rate", 0)) * 100
           branch_rate = float(root.get("branch_rate", 0)) * 100
-          print("## Python coverage")
+          print("## Python coverage (shared job)")
+          print()
+          print("Domain jobs upload their own reports as artifacts. This figure covers the")
+          print("tests no domain claims, so it is a floor rather than the suite total.")
           print()
           print("| Metric | Value |")
           print("| --- | --- |")
           print(f"| Line coverage | {line_rate:.2f}% |")
           print(f"| Branch coverage | {branch_rate:.2f}% |")
           PY
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-shared
+          path: |
+            ${{ inputs.working-directory }}/coverage-shared.xml
+            ${{ inputs.working-directory }}/pytest-shared.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The one stable name for a branch ruleset to require.
+  #
+  # The matrix job names carry a domain and change whenever a domain is added or removed,
+  # and a required context that no longer exists blocks every pull request until someone
+  # edits the ruleset. The lint, type check and security jobs are conditional on inputs,
+  # so requiring them directly would break for a caller that does not pass those. This
+  # job depends on all of them and reports one name regardless.
+  #
+  # `skipped` is treated as success on purpose, and that is the difference from a naive
+  # gate. A job skipped by its `if` is a job the caller did not ask for, and a caller that
+  # passes no `typecheck-command` must not be blocked by a type check that never ran.
+  # Failure and cancellation both fail the gate; cancellation matters because a cancelled
+  # job has not proven anything, and treating it as success would let a run cancelled
+  # mid-flight satisfy the ruleset.
+  all-checks-passed:
+    name: all-checks-passed
+    runs-on: ${{ inputs.runs-on }}
+    needs: [discover, lint, typecheck, security, domain-tests, shared-tests]
+    if: always()
+    steps:
+      - name: Fail unless every upstream job succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": *"(failure|cancelled)"'; then
+            echo "::error::at least one upstream job failed or was cancelled"
+            exit 1
+          fi
+          echo "Every upstream job succeeded or was skipped."

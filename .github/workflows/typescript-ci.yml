@@ -285,3 +285,32 @@ jobs:
           path: ${{ inputs.working-directory }}/playwright-report/
           retention-days: 7
           if-no-files-found: ignore
+
+  # The one stable name for a branch ruleset to require, matching `python-ci.yml`.
+  #
+  # `playwright` is conditional on an input, so requiring it directly would block every
+  # caller that does not run end to end tests. This job depends on both and reports one
+  # name regardless of which ran.
+  #
+  # `skipped` counts as success on purpose: a job skipped by its `if` is a job the caller
+  # did not ask for, and a docs-only pull request whose path filter skipped the build must
+  # not be blocked by a check that never had anything to do. Failure and cancellation both
+  # fail the gate, cancellation because a cancelled job has proven nothing and treating it
+  # as success would let a run cancelled mid-flight satisfy the ruleset.
+  all-checks-passed:
+    name: all-checks-passed
+    runs-on: ${{ inputs.runs-on }}
+    needs: [typescript-ci, playwright]
+    if: always()
+    steps:
+      - name: Fail unless every upstream job succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": *"(failure|cancelled)"'; then
+            echo "::error::at least one upstream job failed or was cancelled"
+            exit 1
+          fi
+          echo "Every upstream job succeeded or was skipped."
