@@ -87,6 +87,15 @@ which is exactly the pre-split behaviour. The workflow can therefore be called u
 1. Add one line under `[tool.webbpulse.ci.domains]` naming the paths it owns.
 2. Open the pull request. `Discover domains` picks it up and a `Tests (<name>)` job appears.
 
+Check the test count before and after. A domain path that matches nothing is not an error -
+the job passes, having collected zero tests - so a typo shows up as a suspiciously fast job
+and a falling total, not as a failure. A path claimed by no domain is the safe direction: it
+runs in `shared`, which is slower but never silent.
+
+Add `pytest-xdist` to the project's dev dependencies if it is not already there. The
+`pytest-workers` input defaults to `auto`, and without the plugin the workflow drops `-n` and
+logs a warning rather than running the domains in parallel.
+
 No workflow edit, and **no ruleset edit**: the required context is `all-checks-passed`, which
 does not change when the matrix does. That is the whole reason the gate exists rather than
 requiring the matrix jobs directly, whose names carry a domain and would leave the ruleset
@@ -807,6 +816,33 @@ pull request or the pull request waits for it forever. Two shapes satisfy that:
 The failure mode of getting this wrong is quiet and total: a pull request that touches only
 `docs/` never triggers the workflow, the required context is never reported, and the pull
 request sits pending forever with auto-merge armed and nothing to tell you why.
+
+### What the split actually bought
+
+Measured on the pull requests that adopted it, comparing the whole pull request check suite
+before and after:
+
+| Repository | Before | After | Longest job after |
+| --- | --- | --- | --- |
+| [CarModPicker](https://github.com/WebbPulse/CarModPicker/actions/runs/34571241652) | 10m21s ([run](https://github.com/WebbPulse/CarModPicker/actions/runs/34566322487)) | **3m59s** | `Tests (identity)` 3m19s |
+| [WebbPulse-Portfolio](https://github.com/WebbPulse/WebbPulse-Portfolio/actions/runs/34570889902) | 7m37s ([run](https://github.com/WebbPulse/WebbPulse-Portfolio/actions/runs/34565617050)) | **3m18s** | `Tests (identity)` 2m43s |
+
+Both "before" figures are the backend CI workflow alone, while "after" is the whole
+consolidated `ci.yml` including frontend and, for CarModPicker, the Chrome extension. The
+comparison is conservative for that reason: the new number covers strictly more work.
+
+The shape of the win matters more than the number. Wall clock now tracks the *largest* domain
+rather than the sum of all of them, so a tenth domain costs nothing as long as it is not the
+slowest one. CarModPicker's ten test jobs spend about 26 minutes of runner time between them
+and finish in under four.
+
+Total compute goes up, not down. This trades runner minutes for wall clock, which is the right
+trade for a check a person is waiting on and the wrong one for a nightly batch.
+
+**Verify the split did not lose tests.** The count before and after must match exactly:
+CarModPicker's was 2055 passed and 10 skipped in both. A domain path that matches nothing is
+not an error - the job passes, having run zero tests - so a typo in `pyproject.toml` shows up
+as a suspiciously fast job and a falling total rather than as a failure.
 
 ### Adding a domain does not touch the ruleset
 
