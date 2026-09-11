@@ -1,16 +1,3 @@
-# Reusable single page app deploy: build, sync to S3, invalidate CloudFront.
-#
-# Hashed Vite assets under assets/ are immutable, so they get a one year max-age.
-# index.html and the other unhashed entry files are re-fetched every time, so they
-# get no-cache. Uploading the hashed assets before index.html means a browser that
-# picks up the new HTML always finds the assets it references.
-#
-# An optional CodeArtifact npm login runs before the install so a frontend importing
-# the shared @webbpulse packages resolves them, and an optional HCP Terraform wait runs
-# before the sync so a deploy never races an apply over the same bucket or distribution.
-#
-# Nothing in this file is estate specific. Bucket, distribution, role ARN, workspace
-# name and build variables all arrive from the calling repository.
 name: SPA Deploy
 
 on:
@@ -33,10 +20,8 @@ on:
         default: "npm"
       cache-dependency-path:
         description: >-
-          Lockfile path for the setup-node cache, relative to the repository root.
-          Empty derives <working-directory>/package-lock.json, or pnpm-lock.yaml for
-          pnpm. A workspaces monorepo keeps its only lockfile at the repository root,
-          so pass "package-lock.json" there.
+          Lockfile path for the setup-node cache, relative to the repository root. Empty
+          derives it from working-directory; a workspaces monorepo passes "package-lock.json".
         type: string
         required: false
         default: ""
@@ -78,9 +63,8 @@ on:
         default: ""
       invalidation-paths:
         description: >-
-          Space separated extra CloudFront invalidation paths. /index.html and / are
-          always invalidated, so this is only for additional paths such as
-          /manifest.webmanifest. Set to /* to invalidate everything.
+          Extra space separated CloudFront invalidation paths. / and /index.html are always
+          invalidated; /* invalidates everything.
         type: string
         required: false
         default: ""
@@ -122,11 +106,8 @@ on:
         default: ""
       codeartifact-namespace:
         description: >-
-          Optional npm scope to bind to CodeArtifact, for example @webbpulse. Set it and
-          only that scope resolves through CodeArtifact while everything else keeps going
-          to the public registry. Leave it empty and CodeArtifact becomes the default
-          registry for every package, which still resolves because the repository proxies
-          its upstream, but routes all public traffic through CodeArtifact.
+          Optional npm scope to bind to CodeArtifact, for example @webbpulse. Empty makes
+          CodeArtifact the default registry for every package instead of just that scope.
         type: string
         required: false
         default: ""
@@ -176,22 +157,18 @@ concurrency:
 
 jobs:
   deploy:
+    name: Build and deploy the SPA
     runs-on: ${{ inputs.runs-on }}
     environment: ${{ inputs.environment }}
     permissions:
       id-token: write
       contents: read
     env:
-      # The secrets context is not available in a step level if, so the two conditions
-      # that gate the Terraform wait are folded into one job level flag here, where it
-      # is available. A caller that passes no tfc-api-token leaves this false.
       TFC_WAIT_ENABLED: ${{ inputs.tfc-workspace != '' && secrets.tfc-api-token != '' }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No step in this workflow uses the checkout token afterwards, so the
-          # credentials are not left behind in .git/config for later steps to reuse.
           persist-credentials: false
 
       - name: Set up Node.js
@@ -201,9 +178,6 @@ jobs:
           cache: ${{ inputs.package-manager }}
           cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/{1}', inputs.working-directory, inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json') }}
 
-      # aws-region is already required, so the only extra input the login needs is the
-      # repository name. Fail here with a clear message rather than with an opaque
-      # action error further down.
       - name: Validate the CodeArtifact inputs
         if: inputs.codeartifact-domain != ''
         env:
@@ -219,9 +193,6 @@ jobs:
             exit 1
           fi
 
-      # The install needs the CodeArtifact registry in place, so the role is assumed
-      # here rather than after the build. The credentials the action exports stay set
-      # for every later step, so the deploy steps below reuse this same session.
       - name: Configure AWS credentials via OIDC for CodeArtifact
         if: inputs.codeartifact-domain != ''
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
@@ -229,12 +200,6 @@ jobs:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      # CodeArtifact hosts the shared @webbpulse packages the frontend imports. The
-      # login writes the registry and auth token into ~/.npmrc, so it has to run before
-      # the install. It runs from the repository root on purpose: inside a workspaces
-      # tree npm resolves config against the workspace package and the registry line
-      # lands in the wrong place. GetAuthorizationToken needs both
-      # codeartifact:GetAuthorizationToken and sts:GetServiceBearerToken on the role.
       - name: Log in to CodeArtifact for npm
         if: inputs.codeartifact-domain != ''
         env:
@@ -287,14 +252,10 @@ jobs:
           print("Applied build environment keys: " + ", ".join(sorted(values)))
           PY
 
-      # The build is purely local. It needs no AWS credentials, and with no
-      # CodeArtifact login configured none exist yet at this point.
       - name: Build
         working-directory: ${{ inputs.working-directory }}
         run: ${{ inputs.build-command }}
 
-      # Skipped when the CodeArtifact login already assumed the role above, so the
-      # deploy never assumes twice in one job.
       - name: Configure AWS credentials via OIDC
         if: inputs.codeartifact-domain == ''
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
@@ -302,11 +263,6 @@ jobs:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      # A Terraform apply touching the same bucket or distribution can land in the
-      # middle of the sync below, so the deploy waits for the workspace to go idle
-      # first. Both the workspace name and the token gate the step: a caller that has
-      # set neither, or has set the workspace but not yet added the token, deploys
-      # exactly as it did before.
       - name: Wait for the HCP Terraform workspace to go idle
         if: env.TFC_WAIT_ENABLED == 'true'
         env:
@@ -329,8 +285,6 @@ jobs:
             | python3 -c "import json, sys; print(json.load(sys.stdin)['data']['id'])")
           echo "Resolved workspace $TFC_WORKSPACE to $WORKSPACE_ID."
 
-          # Every status HCP Terraform treats as the end of a run. Anything else means
-          # a run is still planning, waiting for confirmation, or applying.
           TERMINAL="applied planned_and_finished discarded errored canceled force_canceled"
 
           for ATTEMPT in $(seq 1 "$TFC_WAIT_ATTEMPTS"); do
@@ -371,9 +325,6 @@ jobs:
           fi
           DESTINATION="${DESTINATION%/}/"
 
-          # Pass one: hashed assets only, long lived and immutable. No --delete here,
-          # so the assets the currently served index.html points at survive until the
-          # second pass replaces the HTML.
           INCLUDES=()
           for GLOB in $IMMUTABLE_GLOBS; do
             INCLUDES+=(--include "$GLOB")
@@ -399,10 +350,6 @@ jobs:
           fi
           DESTINATION="${DESTINATION%/}/"
 
-          # Pass two: everything else, no-cache so a deploy is visible immediately.
-          # Still no --delete. Once this pass lands, the edge serves the new HTML and
-          # both the new and the previous asset sets are present, so no request can
-          # miss. Pruning happens in pass three.
           EXCLUDES=()
           for GLOB in $IMMUTABLE_GLOBS; do
             EXCLUDES+=(--exclude "$GLOB")
@@ -412,15 +359,6 @@ jobs:
             "${EXCLUDES[@]}" \
             --cache-control "no-cache, no-store, must-revalidate"
 
-      # Pass three exists because of a specific aws s3 sync behaviour: the CLI
-      # documents --delete as "Files that exist in the destination but not in the
-      # source are deleted during sync. Note that files excluded by filters are
-      # excluded from deletion." A --delete carried on either filtered pass above
-      # would therefore never prune the objects that pass filtered out, and stale
-      # hashed assets would accumulate in the bucket forever. This pass runs over the
-      # whole tree with no --include or --exclude so the delete comparison sees every
-      # key. It uploads nothing new, because passes one and two already uploaded
-      # every source file, so the cache headers written above are preserved.
       - name: Prune objects from earlier builds
         working-directory: ${{ inputs.working-directory }}
         env:
@@ -446,11 +384,6 @@ jobs:
           INVALIDATION_PATHS: ${{ inputs.invalidation-paths }}
         run: |
           set -euo pipefail
-          # The unhashed entry documents always need invalidating: / is what a visitor
-          # requests and /index.html is what the origin serves for it. Hashed assets
-          # never need it, because a new build gives them new keys. Extra paths from
-          # the caller are appended, deliberately unquoted so the space separated
-          # input word splits into separate arguments.
           PATHS=(/index.html /)
           # shellcheck disable=SC2206
           PATHS+=($INVALIDATION_PATHS)
