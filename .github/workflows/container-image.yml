@@ -247,7 +247,6 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "CODEARTIFACT_AUTH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
-      # v1.0.0 and up, which is what a single platform build without attestations
       - name: Build and push the image
         id: build
         if: steps.existing.outputs.exists != 'true'
