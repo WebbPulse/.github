@@ -480,6 +480,14 @@ jobs:
           # Coverage is collected per domain but not gated per domain: a domain job sees
           # only its own tests, so any per-job threshold would measure the wrong thing.
           # The artifacts are uploaded and the shared job prints the summary.
+          # `-n` is xdist's flag, and pytest rejects an unknown argument outright rather
+          # than ignoring it. A caller who has not added pytest-xdist would otherwise get
+          # `unrecognized arguments: -n` from a flag they never wrote, so drop it and say
+          # why instead of failing on the workflow's own default.
+          if [ -n "${PYTEST_WORKERS:-}" ] && ! python -c 'import xdist' 2>/dev/null; then
+            echo "::warning::pytest-xdist is not installed, so tests run single process. Add it to this project's dev dependencies to use pytest-workers."
+            PYTEST_WORKERS=""
+          fi
           eval "python -m pytest ${PYTEST_WORKERS:+-n \"$PYTEST_WORKERS\"} \
             --cov=${{ inputs.coverage-source }} \
             --cov-report=term-missing \
@@ -590,6 +598,14 @@ jobs:
           PY
           )
           echo "Running: $PATHS"
+          # `-n` is xdist's flag, and pytest rejects an unknown argument outright rather
+          # than ignoring it. A caller who has not added pytest-xdist would otherwise get
+          # `unrecognized arguments: -n` from a flag they never wrote, so drop it and say
+          # why instead of failing on the workflow's own default.
+          if [ -n "${PYTEST_WORKERS:-}" ] && ! python -c 'import xdist' 2>/dev/null; then
+            echo "::warning::pytest-xdist is not installed, so tests run single process. Add it to this project's dev dependencies to use pytest-workers."
+            PYTEST_WORKERS=""
+          fi
           eval "python -m pytest ${PYTEST_WORKERS:+-n \"$PYTEST_WORKERS\"} \
             --cov=${{ inputs.coverage-source }} \
             --cov-report=term-missing \
