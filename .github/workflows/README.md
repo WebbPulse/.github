@@ -193,7 +193,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/typescript-ci.yml@v1
+    uses: WebbPulse/.github/.github/workflows/typescript-ci.yml@v2
     with:
       working-directory: frontend
       node-version: "22"
@@ -327,7 +327,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/container-image.yml@v1
+    uses: WebbPulse/.github/.github/workflows/container-image.yml@v2
     with:
       ecr-repository: ${{ vars.ECR_REPOSITORY }}
       aws-region: ${{ vars.AWS_REGION }}
@@ -367,7 +367,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/container-image.yml@v1
+    uses: WebbPulse/.github/.github/workflows/container-image.yml@v2
     with:
       environment: ${{ needs.resolve-env.outputs.name }}
       ecr-repository: webbpulse-${{ needs.resolve-env.outputs.name }}/${{ matrix.domain }}
@@ -396,7 +396,7 @@ jobs:
     outputs:
       function-image-map: ${{ steps.map.outputs.function-image-map }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: manifests
           pattern: image-*
@@ -473,7 +473,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v1
+    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v2
     with:
       aws-region: ${{ vars.AWS_REGION }}
       environment: production
@@ -574,7 +574,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/spa-deploy.yml@v1
+    uses: WebbPulse/.github/.github/workflows/spa-deploy.yml@v2
     with:
       environment: production
       s3-bucket: ${{ vars.FRONTEND_S3_BUCKET }}
@@ -647,7 +647,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v1
+    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v2
     with:
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
       codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
@@ -665,7 +665,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-npm.yml@v1
+    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-npm.yml@v2
     with:
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
       codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
@@ -757,7 +757,7 @@ jobs:
   terraform-checks:
     permissions:
       contents: read
-    uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@v1
+    uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@v2
     with:
       working-directory: terraform
     secrets:
@@ -880,7 +880,7 @@ A caller that wants no moving target at all pins the SHA instead, with the tag i
 comment, exactly as this repository pins third party actions:
 
 ```yaml
-uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v1.4.0
+uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v2.2.1
 ```
 
 Both forms are fine. `@v2` is the current default; pin a SHA where a repository needs a
