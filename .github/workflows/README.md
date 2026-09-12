@@ -518,13 +518,28 @@ not report success before the edge is serving the build.
 **Waiting for HCP Terraform.** A Terraform apply that touches the same bucket or
 distribution can land in the middle of the sync. Set `tfc-organization` and
 `tfc-workspace` and pass the `tfc-api-token` secret, and the deploy polls the
-workspace's most recent run and holds until it reaches a terminal status (`applied`,
+workspace's most recent run and holds until it reaches a settled status (`applied`,
 `planned_and_finished`, `discarded`, `errored`, `canceled`, `force_canceled`) or the
 workspace has no runs at all. Both the workspace input and the token gate the step, so
 a repository that sets neither, or sets the workspace before the token is in place,
 deploys exactly as it did before. `tfc-wait-attempts` and `tfc-wait-interval-seconds`
-tune the poll; the defaults give ten minutes, after which the job fails rather than
-racing the apply.
+tune the poll; the defaults give ten minutes.
+
+A run parked awaiting confirmation is not a wait. No WebbPulse workspace auto-applies,
+so a VCS triggered plan-and-apply run stops in `planned` and stays there until somebody
+confirms it. Polling such a run can only ever time out, so the step reads the run's
+`has-changes` and `actions.is-confirmable` instead:
+
+- **Awaiting confirmation, no resource changes.** Nothing can move under the deploy, so
+  the step reports the run in the job summary and proceeds immediately.
+- **Awaiting confirmation with resource changes.** The deploy would race an apply that
+  is about to happen, so the step fails straight away with the run URL in the log and
+  the job summary. Apply or discard the run, then rerun. This is the same outcome the
+  ten minute timeout produced, reached in seconds instead.
+- **Still planning or applying.** Unchanged: the step polls until the run settles.
+
+A workspace whose API response carries no `actions` object falls back to polling, so the
+behaviour degrades to the old one rather than guessing.
 
 **Private packages.** A frontend that imports the shared `@webbpulse/*` packages needs
 `codeartifact-domain`, `codeartifact-repository` and the `codeartifact-domain-owner`
@@ -721,6 +736,34 @@ exactly, so a single package caller changes nothing.
 Before these inputs existed the only workaround was to fold the root install into
 `build-command`. That still left the setup-node cache step failing on the missing
 lockfile, so it never actually got as far as building.
+
+---
+
+## `actions/tfc-wait`
+
+A composite action holding the same HCP Terraform wait `spa-deploy.yml` runs inline, for
+a repository whose deploy is a plain job rather than a call into a reusable workflow.
+`CarModPicker`'s `backend-deploy.yml` and `frontend-deploy.yml` both use it.
+
+```yaml
+      - name: Wait for HCP Terraform
+        uses: WebbPulse/.github/actions/tfc-wait@v2
+        with:
+          workspace-id: ${{ vars.TFC_WORKSPACE_ID }}
+          api-token: ${{ secrets.TFC_API_TOKEN }}
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `workspace-id` | `""` | `ws-XXXXXXXXXXXXXXXX`. Takes precedence over `organization` plus `workspace`. |
+| `organization` | `""` | Required when `workspace-id` is empty. |
+| `workspace` | `""` | Required when `workspace-id` is empty. |
+| `api-token` | required | HCP Terraform API token with read access to the workspace runs. |
+| `attempts` | `40` | Polls before the step gives up. |
+| `interval-seconds` | `15` | Seconds between polls. |
+
+See [Waiting for HCP Terraform](#spa-deployyml) for what the step does with a run parked
+awaiting confirmation.
 
 ---
 
