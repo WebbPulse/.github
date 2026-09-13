@@ -29,105 +29,125 @@ carry a `concurrency` group so two runs never overlap on one target.
 
 ## `python-ci.yml`
 
+**uv only.** Every job installs with uv from a committed `uv.lock`, pinned to uv 0.12.10.
 Lint, type check and security each run once. Pytest fans out into **one job per domain**
-plus a `shared` job carrying everything no domain claims, so wall clock time tracks the
-largest domain rather than the sum of every domain. A final `all-checks-passed` job is the
-single stable context a branch ruleset requires.
+plus a `shared` job carrying everything outside the domain directories, so wall clock time
+tracks the largest domain rather than the sum of every domain. A final `all-checks-passed`
+job is the single stable context a branch ruleset requires.
 
-An optional CodeArtifact pip login runs before the install in every job that installs, so
-shared private packages resolve.
+An optional CodeArtifact step runs before the install in every job that installs, minting a
+token and exporting it as `UV_INDEX_<NAME>_USERNAME` and `UV_INDEX_<NAME>_PASSWORD` so uv can
+resolve the private index. The token is masked and never printed.
+
+After the install, an **activate** step puts `<working-directory>/.venv/bin` on `PATH` and
+sets `VIRTUAL_ENV`, so `ruff`, `pyright`, `bandit`, `pip-audit`, `python` and `pytest` resolve
+from the project environment without a `uv run` prefix.
 
 ### Jobs
 
 | Job | Runs when | Notes |
 | --- | --- | --- |
-| `Discover domains` | always | Reads `[tool.webbpulse.ci.domains]` in a bare interpreter, no install. |
+| `Discover domains` | always | Walks the test tree in a bare interpreter, no install. |
 | `Lint` | `ruff-target` or `lint-commands` non empty | `ruff check`, `ruff format --check`, then each extra command. |
 | `Type check` | `typecheck-command` non empty | |
 | `Security` | `security-commands` non empty | |
-| `Tests (<domain>)` | one per declared domain | `fail-fast: false`, so a two-domain break needs one run, not two. |
-| `Tests (shared)` | always | Everything no domain claims. Whole suite when none are declared. |
+| `Tests (<domain>)` | one per discovered domain | `fail-fast: false`, so a two-domain break needs one run, not two. |
+| `Tests (shared)` | always | Everything outside the domain directories. Whole suite when there are none. |
 | `all-checks-passed` | always | The context to require. See [Merging: auto-merge on green](#merging-auto-merge-on-green). |
 
-### Declaring domains
+### Domains are directories
 
-The convention lives in the **calling repository's** `pyproject.toml`, so adding a domain to
-CI is adding a line rather than editing a workflow. It is specified, documented and tested in
-the shared [`webbpulse`](https://github.com/WebbPulse/webbpulse-python) package as
-`webbpulse.ci` (0.18.0 and later):
+There is no domain list to maintain. A domain is an **immediate subdirectory of
+`domains-root` that contains at least one `test_*.py` or `*_test.py` anywhere below it**.
+Each domain job runs pytest on `<domains-root>/<domain>`; the `shared` job runs
+`<test-root> --ignore=<domains-root>`, so the jobs together run each test exactly once.
+
+The calling repository's `pyproject.toml` configures the roots:
 
 ```toml
 [tool.webbpulse.ci]
-# Directory the `shared` job sweeps. Defaults to "tests".
 test-root = "tests"
-
-[tool.webbpulse.ci.domains]
-identity = ["tests/auth", "tests/dependencies"]
-catalog  = ["tests/api/endpoints/test_parts.py", "tests/api/endpoints/test_categories.py"]
+domains-root = "tests/domains"
+entrypoints = "app/entrypoints"
 ```
 
-Paths are relative to `working-directory`, so they reach pytest unchanged. A value may name
-a **directory or a single test file**: a suite not yet split by directory still has to be
-splittable, and requiring the files to move first would make adoption a refactor rather than
-a configuration change.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `test-root` | `tests` | Directory the `shared` job sweeps. |
+| `domains-root` | `<test-root>/domains` | Parent of the per-domain test directories. |
+| `entrypoints` | `""` | When set, every domain directory must have a matching module. |
 
-**`shared` is a deselection, not a list.** It runs `test-root` with an `--ignore` for every
-claimed path. So the jobs together run each test exactly once, and a new test file is covered
-the moment it is written. Forgetting to claim a file makes it run in `shared`, which is slower
-but never silent, and that is the right direction for the mistake to fall.
+Paths are relative to `working-directory`. With `entrypoints` set, a domain directory
+`tests/domains/identity` requires `app/entrypoints/identity.py`; a hyphen in a directory name
+maps to an underscore in the module name. Discovery **fails** naming the directories with no
+module and listing the modules that do exist, so a test directory can never drift away from
+the deployable it covers.
 
-`shared` is reserved and cannot be a domain name; a domain claiming no paths is rejected,
-because its job would run pytest with no paths and collect the whole suite.
+A repository with no `domains-root` directory gets no domain jobs and a `shared` job carrying
+everything, so the workflow can be called unconditionally.
 
-A repository with no such table gets no domain jobs and a `shared` job carrying everything,
-which is exactly the pre-split behaviour. The workflow can therefore be called unconditionally.
+A `[tool.webbpulse.ci.domains]` table is a **hard error** in v3. Discovery stops and points at
+the directory convention.
 
 ### Adding a domain
 
-1. Add one line under `[tool.webbpulse.ci.domains]` naming the paths it owns.
+1. Create `tests/domains/<name>/` with the domain's tests, and `app/entrypoints/<name>.py`
+   if `entrypoints` is set.
 2. Open the pull request. `Discover domains` picks it up and a `Tests (<name>)` job appears.
 
-Check the test count before and after. A domain path that matches nothing is not an error -
-the job passes, having collected zero tests - so a typo shows up as a suspiciously fast job
-and a falling total, not as a failure. A path claimed by no domain is the safe direction: it
-runs in `shared`, which is slower but never silent.
+No workflow edit and **no ruleset edit**: the required context is `all-checks-passed`, which
+does not change when the matrix does.
 
-Add `pytest-xdist` to the project's dev dependencies if it is not already there. The
-`pytest-workers` input defaults to `auto`, and without the plugin the workflow drops `-n` and
-logs a warning rather than running the domains in parallel.
-
-No workflow edit, and **no ruleset edit**: the required context is `all-checks-passed`, which
-does not change when the matrix does. That is the whole reason the gate exists rather than
-requiring the matrix jobs directly, whose names carry a domain and would leave the ruleset
-naming a context that no longer exists, blocking every pull request until someone fixed it.
+Add `pytest-xdist` to the project's dev dependency group. The `pytest-workers` input defaults
+to `auto`, and without the plugin the workflow drops `-n` and logs a warning rather than
+running the domains in parallel.
 
 ### Inputs
 
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `python-version` | string | `3.13` | Matches the estate's backends. |
-| `working-directory` | string | `backend` | Directory holding `pyproject.toml`. |
-| `install-command` | string | `python -m pip install --upgrade pip && pip install -r requirements-dev.txt` | Swap for `uv sync` if a repo moves to uv. |
-| `cache-dependency-path` | string | `""` | pip cache key. Empty derives `<working-directory>/requirements*.txt` and `pyproject.toml`. |
+| `python-version` | string | `3.13` | Python uv provisions for the project environment. |
+| `working-directory` | string | `backend` | Directory holding `pyproject.toml` and `uv.lock`. |
+| `install-command` | string | `uv sync --locked` | Run in `working-directory`. Override to float a package, see below. |
 | `ruff-target` | string | `.` | Paths for ruff. Empty skips both ruff steps. |
-| `lint-commands` | string | `""` | Extra lint commands, one per line, for a tool list that predates ruff. |
+| `lint-commands` | string | `""` | Extra lint commands, one per line. |
 | `typecheck-command` | string | `""` | Empty skips the type check job. |
 | `security-commands` | string | `""` | Security scans, one per line. Empty skips the job. |
-| `pytest-args` | string | `""` | Appended to every pytest run. **Not for paths** when domains are declared. |
-| `pytest-workers` | string | `auto` | Value for xdist `-n`. Empty omits `-n` for a suite that is not xdist safe. Needs `pytest-xdist` in the project's dev dependencies; without it the flag is dropped and the job logs a warning. |
+| `pytest-args` | string | `""` | Appended to every pytest run. **Not for paths.** |
+| `pytest-workers` | string | `auto` | Value for xdist `-n`. Empty omits `-n` for a suite that is not xdist safe. |
 | `coverage-source` | string | `app` | Package measured by coverage. |
 | `test-env-json` | string | `{}` | Env vars exported before pytest. Not for secrets: inputs appear in the log. |
 | `runs-on` | string | `ubuntu-latest` | Runner label. |
-| `codeartifact-domain` | string | `""` | Non empty enables the CodeArtifact login. |
-| `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`, validated at run time. |
-| `aws-region` | string | `""` | Required with `codeartifact-domain`, validated at run time. |
+| `codeartifact-domain` | string | `""` | Non empty enables the CodeArtifact auth step. |
+| `codeartifact-index` | string | `codeartifact` | Name of the `[[tool.uv.index]]` entry the token authenticates. |
+| `aws-region` | string | `""` | Required with `codeartifact-domain`. |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
-| `role-to-assume` | no | Needed only for the CodeArtifact login. |
+| `role-to-assume` | no | Needed only for the CodeArtifact auth step. |
 | `codeartifact-domain-owner` | no | Account id owning the domain. |
 
 Outputs: none.
+
+### The `codeartifact` index name
+
+`codeartifact-index` must match the `name` of the `[[tool.uv.index]]` entry in the caller's
+`pyproject.toml`. The workflow upper-cases it and replaces every non-alphanumeric character
+with an underscore to build the variable names, so the conventional `codeartifact` becomes
+`UV_INDEX_CODEARTIFACT_USERNAME` and `UV_INDEX_CODEARTIFACT_PASSWORD`:
+
+```toml
+[[tool.uv.index]]
+name = "codeartifact"
+url = "https://<domain>-<owner>.d.codeartifact.<region>.amazonaws.com/pypi/<repository>/"
+explicit = true
+
+[tool.uv.sources]
+webbpulse = { index = "codeartifact" }
+```
+
+`explicit = true` plus the `tool.uv.sources` binding means the private package can only ever
+be satisfied from CodeArtifact, never from PyPI.
 
 Coverage is collected per job and uploaded as an artifact per domain. It is **not** gated per
 domain: a domain job sees only its own tests, so any per-job threshold would measure the wrong
@@ -139,18 +159,27 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v2
+    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v3
     with:
       working-directory: backend
       coverage-source: app
       typecheck-command: pyright
+      codeartifact-domain: webbpulse
+      aws-region: us-west-2
+      install-command: >-
+        uv lock --upgrade-package webbpulse && uv sync --locked &&
+        uv run --no-sync python -c "import importlib.metadata as m; print('webbpulse', m.version('webbpulse'))"
       security-commands: |
         bandit -r app -ll
-        pip-audit -r requirements.txt
+        uv export --frozen --no-dev --no-emit-project --no-hashes -o /tmp/requirements-audit.txt && pip-audit --no-deps -r /tmp/requirements-audit.txt
+    secrets:
+      role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+      codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
 ```
 
----
-
+That `install-command` re-locks only `webbpulse`, so an adopter picks up the newest shared
+package on every run while every other dependency stays at the committed lock. A repository
+that is itself the package uses the default `uv sync --locked`.
 ---
 
 ## `typescript-ci.yml`
@@ -617,9 +646,10 @@ the artifacts account. Both are idempotent: the version is looked up with
 skipped with a `::notice::` rather than failing, so re-running a released tag stays
 green.
 
-The Python workflow builds with `python -m build`, reads the name and version off the
-wheel filename, and uploads with `aws codeartifact login --tool twine` followed by
-`twine upload --repository codeartifact`. The npm workflow reads name and version
+The Python workflow builds with `uv build` (uv pinned to 0.12.10), reads the name and
+version off the wheel filename, and uploads with `uv publish`, pointed at the repository
+through `UV_PUBLISH_URL` and authenticated with `UV_PUBLISH_USERNAME=aws` plus a masked
+`UV_PUBLISH_PASSWORD` token. No pip, build or twine is installed. The npm workflow reads name and version
 from `package.json`, splits a scoped name into the CodeArtifact namespace and package
 name, and publishes with `aws codeartifact login --tool npm` followed by `npm publish`.
 
@@ -633,7 +663,8 @@ repository. Tokens last 12 hours by default.
 
 Shared inputs: `working-directory`, `codeartifact-domain` (required),
 `codeartifact-repository` (required), `aws-region` (required), `environment` and
-`runs-on`. `codeartifact-publish-python.yml` adds `python-version`.
+`runs-on`. `codeartifact-publish-python.yml` adds `python-version`, which is the Python
+uv builds against. Inputs, secrets and outputs are unchanged from v2.
 
 `codeartifact-publish-npm.yml` adds:
 
@@ -662,7 +693,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v2
+    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v3
     with:
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
       codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
@@ -923,11 +954,35 @@ A caller that wants no moving target at all pins the SHA instead, with the tag i
 comment, exactly as this repository pins third party actions:
 
 ```yaml
-uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v2.2.1
+uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v3.0.0
 ```
 
-Both forms are fine. `@v2` is the current default; pin a SHA where a repository needs a
+Both forms are fine. `@v3` is the current default for the Python workflows and `@v2` for the rest; pin a SHA where a repository needs a
 change to this repository to be an explicit, reviewed event.
+
+### v2 to v3 (Python workflows)
+
+`v3` moves `python-ci.yml` and `codeartifact-publish-python.yml` to **uv**. What a caller
+must change:
+
+- Commit a `uv.lock` and give `pyproject.toml` a `[dependency-groups] dev` list, a
+  `[[tool.uv.index]]` named `codeartifact` with `explicit = true`, and a `[tool.uv.sources]`
+  binding for the private package. Requirements files are no longer read by anything.
+- Drop the `cache-dependency-path` and `codeartifact-repository` inputs from the `python-ci`
+  call. Both were removed. Caching keys off `<working-directory>/uv.lock` automatically, and
+  the repository is part of the index URL in `pyproject.toml` rather than a workflow input.
+- Replace `install-command` with a uv command. The default is `uv sync --locked`.
+- Replace any `pip-audit -r requirements.txt` in `security-commands` with the `uv export`
+  pipeline shown above.
+- Delete `[tool.webbpulse.ci.domains]` and move each domain's tests under
+  `tests/domains/<domain>/`. The table is now a hard error, not a warning. Set `entrypoints`
+  to have discovery enforce that every domain directory has a deployable module.
+
+`codeartifact-publish-python.yml` keeps every input, secret and output, so that call needs
+only `@v2` changed to `@v3`.
+
+`v2` stops moving for the Python workflows and remains available. The TypeScript, container
+and deploy workflows are untouched by `v3`.
 
 ### v1 to v2
 
@@ -958,8 +1013,7 @@ What a caller repository has to provide before these workflows will run.
 **Repository content**
 
 - A **ruff** configuration for `python-ci.yml`, in `pyproject.toml` (`[tool.ruff]`) or
-  `ruff.toml`, and `ruff` present in the dev requirements the `install-command`
-  installs. The workflow runs `ruff check` and `ruff format --check`, so a repository
+  `ruff.toml`, and `ruff` in the `[dependency-groups] dev` list that `uv sync` installs. The workflow runs `ruff check` and `ruff format --check`, so a repository
   that has never run the formatter should run `ruff format` once and commit first.
 - `lint`, `type-check` and `build` scripts in `package.json` for `typescript-ci.yml`,
   or the matching `*-command` inputs set to `""` to skip them.
@@ -1031,6 +1085,7 @@ Current pins:
 | --- | --- | --- |
 | `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` |
 | `actions/setup-python` | v7.0.0 | `5fda3b95a4ea91299a34e894583c3862153e4b97` |
+| `astral-sh/setup-uv` | v10.1.0 | `bec219d24cd3e171d82865faccec33120bb574f4` |
 | `actions/setup-node` | v7.0.0 | `820762786026740c76f36085b0efc47a31fe5020` |
 | `actions/upload-artifact` | v7.0.1 | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
 | `aws-actions/configure-aws-credentials` | v6.2.4 | `cbe3b392738ccf3f987d68400dafcf4b0624a56c` |
