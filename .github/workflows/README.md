@@ -683,18 +683,20 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `environment` | string | required | `staging` or `production`. Also the GitHub Environment. |
-| `sha` | string | `""` | Commit the check run lands on. Empty means `github.sha`. |
-| `api-base-url` | string | required | |
-| `web-base-url` | string | required | |
-| `aws-region` | string | required | |
-| `api-id` | string | required | API Gateway v2 api id, normally a terraform output. |
-| `access-log-group` | string | required | Gateway access log group. |
-| `gate-ssm-parameter` | string | `""` | Staging gate parameter name. Empty skips the gate. |
-| `gate-signing-key-ssm-parameter` | string | `""` | Gate signing key parameter. Empty means no web gate. |
-| `gate-key-pair-id` | string | `""` | CloudFront public key id for the minted cookies. |
-| `gate-cookie-domain` | string | `""` | Domain the minted cookies are scoped to. |
-| `user-email` | string | required | Durable e2e user, from the environment's `vars`. |
+| `environment` | string | `""` | `staging` or `production`. Empty derives it from the deployed branch. |
+| `sha` | string | `""` | Commit the check run lands on. Empty lets the gate resolve it. |
+| `deploy-workflows` | string | `""` | Comma separated deploy workflow names, in ownership order. Empty disables the sibling wait. |
+| `production-branch` | string | `main` | Branch whose deploys mean production. |
+| `api-base-url` | string | `""` | Empty reads `vars.E2E_API_BASE_URL`. |
+| `web-base-url` | string | `""` | Empty reads `vars.E2E_WEB_BASE_URL`. |
+| `aws-region` | string | `us-west-2` | |
+| `api-id` | string | `""` | API Gateway v2 api id. Empty reads `vars.E2E_API_ID`. |
+| `access-log-group` | string | `""` | Empty reads `vars.E2E_ACCESS_LOG_GROUP`. |
+| `gate-ssm-parameter` | string | `""` | Empty reads `vars.E2E_GATE_SSM_PARAMETER`. |
+| `gate-signing-key-ssm-parameter` | string | `""` | Empty reads `vars.E2E_GATE_SIGNING_KEY_SSM_PARAMETER`. |
+| `gate-key-pair-id` | string | `""` | Empty reads `vars.E2E_GATE_KEY_PAIR_ID`. |
+| `gate-cookie-domain` | string | `""` | Empty reads `vars.E2E_GATE_COOKIE_DOMAIN`. |
+| `user-email` | string | `""` | Durable e2e user. Empty reads `vars.E2E_USER_EMAIL`. |
 | `working-directory` | string | `.` | Python project root with `pyproject.toml` and `uv.lock`. |
 | `e2e-directory` | string | `e2e` | Directory pytest collects, relative to `working-directory`. |
 | `install-command` | string | `uv sync --locked --only-group e2e` | |
@@ -703,61 +705,132 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | `browser` | string | `chromium` | Playwright browser the suite drives. |
 | `headless` | boolean | `true` | Run the browser headless. |
 | `check-name` | string | `""` | Empty derives `e2e (<environment>)`. |
-| `legacy-route-names` | string | `""` | Comma separated, must not appear in the bundle. |
-| `mint-enabled` | boolean | `false` | Staging only. `mint_test_token` refuses production itself. |
-| `kms-key-id` | string | `""` | |
-| `issuer` | string | `""` | |
-| `audience` | string | `""` | |
+| `legacy-route-names` | string | `""` | Comma separated, must not appear in the bundle. Empty reads `vars.E2E_LEGACY_ROUTE_NAMES`. |
+| `mint-enabled` | boolean | `false` | Also turns on when the resolved KMS key id is non-empty. |
+| `kms-key-id` | string | `""` | Empty reads `vars.E2E_KMS_KEY_ID`. |
+| `issuer` | string | `""` | Empty reads `vars.E2E_ISSUER`. |
+| `audience` | string | `""` | Empty reads `vars.E2E_AUDIENCE`. |
 | `codeartifact-domain` | string | `""` | Empty skips the CodeArtifact auth step. |
 | `codeartifact-index` | string | `codeartifact` | |
 | `runs-on` | string | `ubuntu-latest` | |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
-| `role-to-assume` | yes | Reads the gateway, the access log group and the gate parameter. |
+| `role-to-assume` | no | Reads the gateway, the access log group and the gate parameter. Empty reads `vars.AWS_DEPLOY_ROLE_ARN`. |
 | `E2E_USER_PASSWORD` | yes | Durable e2e user's password. Define it as an Environment secret: the job runs under the target environment, so that value is the one read, and the repository-level value may stay unset. `e2e-user-password` is the deprecated name. |
-| `codeartifact-domain-owner` | no | Required when `codeartifact-domain` is set. |
+| `codeartifact-domain-owner` | no | Required when `codeartifact-domain` is set. Empty reads `vars.CODEARTIFACT_DOMAIN_OWNER`. |
 
 Outputs: none. The result is the check run and the job conclusion.
 
-The caller adds an `e2e` job to its deploy workflow, needing the deploy job:
+The caller must grant `actions: read` so the gate can poll sibling deploy runs.
+
+### The caller
+
+The workflow carries the gate, the environment resolution and the value lookup, so a caller
+is a trigger block and a `uses:`. This is the standard shape for every product:
 
 ```yaml
+name: E2E
+
+on:
+  workflow_run:
+    workflows: ["Deploy Backend", "Frontend Deploy"]
+    types: [completed]
+    branches: [main, staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: e2e-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   e2e:
-    needs: [resolve-env, deploy]
     permissions:
       contents: read
+      actions: read
       id-token: write
       checks: write
     uses: WebbPulse/.github/.github/workflows/e2e.yml@v3
     with:
-      environment: ${{ needs.resolve-env.outputs.environment }}
-      api-base-url: ${{ vars.API_BASE_URL }}
-      web-base-url: ${{ vars.WEB_BASE_URL }}
-      aws-region: ${{ vars.AWS_REGION }}
-      api-id: ${{ vars.API_ID }}
-      access-log-group: ${{ vars.API_ACCESS_LOG_GROUP }}
-      gate-ssm-parameter: ${{ vars.GATE_SSM_PARAMETER }}
-      gate-signing-key-ssm-parameter: ${{ vars.GATE_SIGNING_KEY_SSM_PARAMETER }}
-      gate-key-pair-id: ${{ vars.GATE_KEY_PAIR_ID }}
-      gate-cookie-domain: ${{ vars.GATE_COOKIE_DOMAIN }}
-      user-email: ${{ vars.E2E_USER_EMAIL }}
+      deploy-workflows: "Deploy Backend, Frontend Deploy"
       working-directory: backend
-      legacy-route-names: ${{ vars.LEGACY_ROUTE_NAMES }}
-      mint-enabled: ${{ vars.E2E_MINT_ENABLED == 'true' }}
-      kms-key-id: ${{ vars.IDENTITY_KMS_KEY_ID }}
-      issuer: ${{ vars.IDENTITY_ISSUER }}
-      audience: ${{ vars.IDENTITY_AUDIENCE }}
-      codeartifact-domain: webbpulse
+      install-command: uv sync --locked --group e2e
+      pytest-args: "--no-cov"
     secrets:
-      role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
       E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
-      codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
 ```
 
-`checks: write` must be granted on the calling job, not only inside this workflow, because a
-reusable workflow can never hold a permission its caller did not.
+`deploy-workflows` must list the same workflow names as the `workflow_run` trigger, in
+ownership order. `actions: read` is what lets the gate poll sibling runs, and `checks: write`
+must be granted on the calling job, not only inside this workflow, because a reusable workflow
+can never hold a permission its caller did not.
+
+`cancel-in-progress: false` is deliberate. A staging and a production run can be in flight at
+once, and cancelling the earlier one would leave its check run unpublished.
+
+### The gate
+
+The first job decides whether this run owns the suite, which commit it verifies, and which
+environment it targets.
+
+- On `workflow_dispatch`, when `deploy-workflows` is empty, or on any event that is not
+  `workflow_run`, the run owns the suite. The commit is the `sha` input or `github.sha`, and
+  the environment is the `environment` input or derived from `github.ref_name`.
+- On `workflow_run` the triggering deploy must have concluded `success`, otherwise the suite
+  is skipped. The commit is the deploy's `head_sha`, and the environment is `production` when
+  the deploy's branch equals `production-branch` and `staging` otherwise. An explicit
+  `environment` input wins over the derivation.
+- Each name in `deploy-workflows` is then polled on that commit, every 30 seconds for up to
+  30 minutes. A name with **no run on the commit** was path filtered and is ignored. A name
+  still running is waited for. A name that completed **without** success skips the suite,
+  since there is nothing sound to verify.
+- Ownership is deterministic: the **first** name in `deploy-workflows` order that has a run on
+  the commit owns the suite. Every other triggering workflow yields, so two green deploys on
+  one commit produce exactly one suite run rather than two.
+
+### Environment variables
+
+Every value resolves as the explicit `with:` input when non-empty, and otherwise as a
+variable on the GitHub Environment the gate selected. Products that follow the convention set
+variables and pass no value inputs at all.
+
+| Variable | staging | production |
+| --- | --- | --- |
+| `E2E_API_BASE_URL` | required | required |
+| `E2E_WEB_BASE_URL` | required | required |
+| `E2E_USER_EMAIL` | required | required |
+| `AWS_DEPLOY_ROLE_ARN` | required | required |
+| `E2E_API_ID` | required | required |
+| `E2E_ACCESS_LOG_GROUP` | required | required |
+| `E2E_ISSUER` | required | required |
+| `E2E_AUDIENCE` | required | required |
+| `E2E_LEGACY_ROUTE_NAMES` | optional | optional |
+| `CODEARTIFACT_DOMAIN_OWNER` | with `codeartifact-domain` | with `codeartifact-domain` |
+| `E2E_GATE_SSM_PARAMETER` | required | unset |
+| `E2E_GATE_SIGNING_KEY_SSM_PARAMETER` | required | unset |
+| `E2E_GATE_KEY_PAIR_ID` | required | unset |
+| `E2E_GATE_COOKIE_DOMAIN` | required | unset |
+| `E2E_KMS_KEY_ID` | required | unset |
+
+`E2E_USER_PASSWORD` is an Environment **secret**, not a variable, and is the one value the
+caller still passes through `secrets:`.
+
+The gate variables and `E2E_KMS_KEY_ID` are unset in production because production has no
+access gate and refuses minted tokens. Minting turns on when the resolved `E2E_KMS_KEY_ID` is
+non-empty or `mint-enabled` is true, so leaving the production variable unset is what keeps
+minting to staging.
+
+A step before anything else lists every required value that resolved empty in one error, so a
+missing variable fails in seconds rather than midway through the suite.
+
+**Explicit inputs are overrides.** A product that cannot use the variable names, or that needs
+a value the convention does not cover, passes it with `with:` and that wins. The inputs are
+unchanged, so a caller written against the earlier tag keeps working.
 
 **Branch protection.** Add `e2e (staging)`, or whatever `check-name` resolves to on staging,
 to the required status checks on `main` in the product's ruleset. The staging deploy publishes

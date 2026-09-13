@@ -4,34 +4,65 @@ on:
   workflow_call:
     inputs:
       environment:
-        description: "Target environment name, staging or production. Also the GitHub Environment the job runs in."
-        type: string
-        required: true
-      sha:
-        description: "Commit the check run is published on. Defaults to the caller's github.sha, which is the deployed commit."
+        description: >-
+          Target environment name, staging or production. Also the GitHub Environment the
+          suite job runs in. Empty lets the gate derive it from the deployed branch, which
+          is the standard caller shape.
         type: string
         required: false
         default: ""
+      sha:
+        description: >-
+          Commit the check run is published on. Empty lets the gate resolve it, which is the
+          triggering deploy's head_sha on a workflow_run and github.sha otherwise.
+        type: string
+        required: false
+        default: ""
+      deploy-workflows:
+        description: >-
+          Comma separated names of the caller's deploy workflows, in ownership order, for
+          example "Deploy Backend, Frontend Deploy". The first name with a run on the
+          deployed commit owns the suite; the others are waited for and then yield. Empty
+          disables the sibling wait and every workflow_run trigger owns its own suite.
+        type: string
+        required: false
+        default: ""
+      production-branch:
+        description: "Branch whose deploys mean production. Every other branch derives staging."
+        type: string
+        required: false
+        default: "main"
       api-base-url:
-        description: "Base URL of the deployed API, for example https://api.staging.example.com."
+        description: >-
+          Base URL of the deployed API, for example https://api.staging.example.com.
+          Empty reads the environment variable E2E_API_BASE_URL.
         type: string
-        required: true
+        required: false
+        default: ""
       web-base-url:
-        description: "Base URL of the deployed web origin."
+        description: "Base URL of the deployed web origin. Empty reads the environment variable E2E_WEB_BASE_URL."
         type: string
-        required: true
+        required: false
+        default: ""
       aws-region:
         description: "AWS region holding the gateway, the access log group and the identity key."
         type: string
-        required: true
+        required: false
+        default: "us-west-2"
       api-id:
-        description: "API Gateway v2 api id, used to read the live route table."
+        description: >-
+          API Gateway v2 api id, used to read the live route table. Empty reads the
+          environment variable E2E_API_ID.
         type: string
-        required: true
+        required: false
+        default: ""
       access-log-group:
-        description: "CloudWatch log group carrying the gateway access log."
+        description: >-
+          CloudWatch log group carrying the gateway access log. Empty reads the environment
+          variable E2E_ACCESS_LOG_GROUP.
         type: string
-        required: true
+        required: false
+        default: ""
       gate-ssm-parameter:
         description: >-
           SSM SecureString parameter holding the staging x-origin-verify value. The suite reads
@@ -59,9 +90,12 @@ on:
         required: false
         default: ""
       user-email:
-        description: "Address of the durable e2e user, normally a GitHub Environment variable."
+        description: >-
+          Address of the durable e2e user. Empty reads the environment variable
+          E2E_USER_EMAIL, which is the standard source.
         type: string
-        required: true
+        required: false
+        default: ""
       working-directory:
         description: "Python project root holding pyproject.toml and uv.lock."
         type: string
@@ -146,8 +180,10 @@ on:
         default: "ubuntu-latest"
     secrets:
       role-to-assume:
-        description: "IAM role ARN assumed via OIDC to read the gateway, the access log and the gate parameter."
-        required: true
+        description: >-
+          IAM role ARN assumed via OIDC to read the gateway, the access log and the gate
+          parameter. Empty reads the environment variable AWS_DEPLOY_ROLE_ARN.
+        required: false
       E2E_USER_PASSWORD:
         description: "Password of the durable e2e user. Define it as an Environment secret; the job runs under the target environment, so that value is the one read. Masked by GitHub and never echoed."
         required: false
@@ -155,51 +191,203 @@ on:
         description: "Deprecated name for E2E_USER_PASSWORD, read only when the new name is empty."
         required: false
       codeartifact-domain-owner:
-        description: "AWS account id that owns the CodeArtifact domain."
+        description: >-
+          AWS account id that owns the CodeArtifact domain. Empty reads the environment
+          variable CODEARTIFACT_DOMAIN_OWNER.
         required: false
 
 permissions:
   contents: read
 
 jobs:
-  e2e:
-    name: e2e (${{ inputs.environment }})
+  gate:
+    name: gate
     runs-on: ${{ inputs.runs-on }}
-    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      sha: ${{ steps.decide.outputs.sha }}
+      environment: ${{ steps.decide.outputs.environment }}
+    steps:
+      - name: Decide whether this run owns the suite
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          THIS_WORKFLOW: ${{ github.event.workflow_run.name }}
+          DEPLOY_WORKFLOWS: ${{ inputs.deploy-workflows }}
+          PRODUCTION_BRANCH: ${{ inputs.production-branch }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_SHA: ${{ inputs.sha }}
+          FALLBACK_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          emit() {
+            echo "run=$1" >> "$GITHUB_OUTPUT"
+            echo "sha=$2" >> "$GITHUB_OUTPUT"
+            echo "environment=$3" >> "$GITHUB_OUTPUT"
+          }
+
+          derive_environment() {
+            if [ -n "$INPUT_ENVIRONMENT" ]; then
+              echo "$INPUT_ENVIRONMENT"
+            elif [ "$1" = "$PRODUCTION_BRANCH" ]; then
+              echo production
+            else
+              echo staging
+            fi
+          }
+
+          if [ "$EVENT_NAME" != "workflow_run" ] || [ -z "$DEPLOY_WORKFLOWS" ]; then
+            SHA="${INPUT_SHA:-$GITHUB_SHA}"
+            ENVIRONMENT=$(derive_environment "$FALLBACK_BRANCH")
+            echo "No sibling gating applies for a ${EVENT_NAME} event; this run owns the suite."
+            emit true "$SHA" "$ENVIRONMENT"
+            exit 0
+          fi
+
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "${THIS_WORKFLOW} concluded ${CONCLUSION}, so there is nothing sound to verify."
+            emit false "" ""
+            exit 0
+          fi
+
+          SHA="${INPUT_SHA:-$HEAD_SHA}"
+          ENVIRONMENT=$(derive_environment "$HEAD_BRANCH")
+          echo "Verifying ${ENVIRONMENT} at ${SHA}."
+
+          mapfile -t NAMES < <(echo "$DEPLOY_WORKFLOWS" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$')
+
+          runs_for() {
+            gh api "repos/${REPOSITORY}/actions/runs?head_sha=${SHA}&per_page=100" \
+              --jq "[.workflow_runs[] | select(.name == \"$1\")]"
+          }
+
+          for ATTEMPT in $(seq 1 60); do
+            PENDING_NAME=""
+            OWNER=""
+            FAILED_NAME=""
+
+            for NAME in "${NAMES[@]}"; do
+              RUNS=$(runs_for "$NAME")
+              COUNT=$(echo "$RUNS" | jq 'length')
+
+              if [ "$COUNT" -eq 0 ]; then
+                echo "No ${NAME} run exists on ${SHA}; this commit did not touch it."
+                continue
+              fi
+
+              if [ -z "$OWNER" ]; then
+                OWNER="$NAME"
+              fi
+
+              UNFINISHED=$(echo "$RUNS" | jq '[.[] | select(.status != "completed")] | length')
+              if [ "$UNFINISHED" -gt 0 ]; then
+                PENDING_NAME="$NAME"
+                break
+              fi
+
+              SUCCEEDED=$(echo "$RUNS" | jq '[.[] | select(.conclusion == "success")] | length')
+              if [ "$SUCCEEDED" -eq 0 ]; then
+                FAILED_NAME="$NAME"
+                break
+              fi
+            done
+
+            if [ -n "$FAILED_NAME" ]; then
+              echo "${FAILED_NAME} did not succeed on ${SHA}; the suite has nothing sound to run against."
+              emit false "$SHA" "$ENVIRONMENT"
+              exit 0
+            fi
+
+            if [ -n "$PENDING_NAME" ]; then
+              echo "Waiting for ${PENDING_NAME} on ${SHA} (attempt ${ATTEMPT}/60)."
+              sleep 30
+              continue
+            fi
+
+            if [ -z "$OWNER" ]; then
+              echo "No listed deploy workflow has a run on ${SHA}; this run owns the suite."
+              emit true "$SHA" "$ENVIRONMENT"
+              exit 0
+            fi
+
+            if [ "$THIS_WORKFLOW" = "$OWNER" ]; then
+              echo "Every deploy on ${SHA} is green and ${OWNER} owns the suite, which is this run."
+              emit true "$SHA" "$ENVIRONMENT"
+            else
+              echo "Every deploy on ${SHA} is green and ${OWNER} owns the suite, so this run yields."
+              emit false "$SHA" "$ENVIRONMENT"
+            fi
+            exit 0
+          done
+
+          echo "::error::The deploy workflows on ${SHA} did not all finish within 30 minutes."
+          emit false "$SHA" "$ENVIRONMENT"
+
+  e2e:
+    name: e2e
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ needs.gate.outputs.environment }}
     permissions:
       contents: read
       id-token: write
       checks: write
     env:
-      E2E_ENVIRONMENT: ${{ inputs.environment }}
-      E2E_API_BASE_URL: ${{ inputs.api-base-url }}
-      E2E_WEB_BASE_URL: ${{ inputs.web-base-url }}
+      E2E_ENVIRONMENT: ${{ needs.gate.outputs.environment }}
+      E2E_API_BASE_URL: ${{ inputs.api-base-url != '' && inputs.api-base-url || vars.E2E_API_BASE_URL }}
+      E2E_WEB_BASE_URL: ${{ inputs.web-base-url != '' && inputs.web-base-url || vars.E2E_WEB_BASE_URL }}
       E2E_AWS_REGION: ${{ inputs.aws-region }}
-      E2E_API_ID: ${{ inputs.api-id }}
-      E2E_ACCESS_LOG_GROUP: ${{ inputs.access-log-group }}
-      E2E_GATE_SSM_PARAMETER: ${{ inputs.gate-ssm-parameter }}
-      E2E_GATE_SIGNING_KEY_SSM_PARAMETER: ${{ inputs.gate-signing-key-ssm-parameter }}
-      E2E_GATE_KEY_PAIR_ID: ${{ inputs.gate-key-pair-id }}
-      E2E_GATE_COOKIE_DOMAIN: ${{ inputs.gate-cookie-domain }}
+      E2E_API_ID: ${{ inputs.api-id != '' && inputs.api-id || vars.E2E_API_ID }}
+      E2E_ACCESS_LOG_GROUP: ${{ inputs.access-log-group != '' && inputs.access-log-group || vars.E2E_ACCESS_LOG_GROUP }}
+      E2E_GATE_SSM_PARAMETER: ${{ inputs.gate-ssm-parameter != '' && inputs.gate-ssm-parameter || vars.E2E_GATE_SSM_PARAMETER }}
+      E2E_GATE_SIGNING_KEY_SSM_PARAMETER: ${{ inputs.gate-signing-key-ssm-parameter != '' && inputs.gate-signing-key-ssm-parameter || vars.E2E_GATE_SIGNING_KEY_SSM_PARAMETER }}
+      E2E_GATE_KEY_PAIR_ID: ${{ inputs.gate-key-pair-id != '' && inputs.gate-key-pair-id || vars.E2E_GATE_KEY_PAIR_ID }}
+      E2E_GATE_COOKIE_DOMAIN: ${{ inputs.gate-cookie-domain != '' && inputs.gate-cookie-domain || vars.E2E_GATE_COOKIE_DOMAIN }}
       E2E_BROWSER: ${{ inputs.browser }}
       E2E_HEADLESS: ${{ inputs.headless }}
-      E2E_USER_EMAIL: ${{ inputs.user-email }}
+      E2E_USER_EMAIL: ${{ inputs.user-email != '' && inputs.user-email || vars.E2E_USER_EMAIL }}
       E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD != '' && secrets.E2E_USER_PASSWORD || secrets.e2e-user-password }}
-      E2E_MINT_ENABLED: ${{ inputs.mint-enabled }}
-      E2E_KMS_KEY_ID: ${{ inputs.kms-key-id }}
-      E2E_ISSUER: ${{ inputs.issuer }}
-      E2E_AUDIENCE: ${{ inputs.audience }}
+      E2E_MINT_ENABLED: ${{ inputs.mint-enabled || (inputs.kms-key-id != '' && inputs.kms-key-id || vars.E2E_KMS_KEY_ID) != '' }}
+      E2E_KMS_KEY_ID: ${{ inputs.kms-key-id != '' && inputs.kms-key-id || vars.E2E_KMS_KEY_ID }}
+      E2E_ISSUER: ${{ inputs.issuer != '' && inputs.issuer || vars.E2E_ISSUER }}
+      E2E_AUDIENCE: ${{ inputs.audience != '' && inputs.audience || vars.E2E_AUDIENCE }}
       E2E_RUN_ID: ${{ github.run_id }}
-      E2E_LEGACY_ROUTE_NAMES: ${{ inputs.legacy-route-names }}
+      E2E_LEGACY_ROUTE_NAMES: ${{ inputs.legacy-route-names != '' && inputs.legacy-route-names || vars.E2E_LEGACY_ROUTE_NAMES }}
       AWS_REGION: ${{ inputs.aws-region }}
-      TARGET_SHA: ${{ inputs.sha != '' && inputs.sha || github.sha }}
-      CHECK_NAME: ${{ inputs.check-name != '' && inputs.check-name || format('e2e ({0})', inputs.environment) }}
+      ROLE_TO_ASSUME: ${{ secrets.role-to-assume != '' && secrets.role-to-assume || vars.AWS_DEPLOY_ROLE_ARN }}
+      TARGET_SHA: ${{ needs.gate.outputs.sha }}
+      CHECK_NAME: ${{ inputs.check-name != '' && inputs.check-name || format('e2e ({0})', needs.gate.outputs.environment) }}
       JUNIT_PATH: ${{ inputs.working-directory }}/e2e-results.xml
     steps:
+      - name: Check every required value resolved
+        run: |
+          set -euo pipefail
+          MISSING=""
+          for NAME in E2E_API_BASE_URL E2E_WEB_BASE_URL E2E_USER_EMAIL ROLE_TO_ASSUME E2E_USER_PASSWORD; do
+            if [ -z "${!NAME}" ]; then
+              MISSING="${MISSING} ${NAME}"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::These values resolved empty for the ${E2E_ENVIRONMENT} environment:${MISSING}. Set them as Environment variables on ${E2E_ENVIRONMENT}, or pass them as explicit inputs. E2E_USER_PASSWORD is an Environment secret."
+            exit 1
+          fi
+          echo "Every required value resolved for ${E2E_ENVIRONMENT}."
+
       - name: Check out the deployed commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.sha != '' && inputs.sha || github.sha }}
+          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
 
       - name: Set up uv
@@ -213,14 +401,14 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         with:
-          role-to-assume: ${{ secrets.role-to-assume }}
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
           aws-region: ${{ inputs.aws-region }}
 
       - name: Authenticate the CodeArtifact index for uv
         if: inputs.codeartifact-domain != ''
         env:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
-          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner != '' && secrets.codeartifact-domain-owner || vars.CODEARTIFACT_DOMAIN_OWNER }}
           CODEARTIFACT_INDEX: ${{ inputs.codeartifact-index }}
         run: |
           set -euo pipefail
@@ -246,15 +434,6 @@ jobs:
           set -euo pipefail
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
-
-      - name: Check the e2e user secret is present
-        run: |
-          set -euo pipefail
-          if [ -z "$E2E_USER_PASSWORD" ]; then
-            echo "::error::E2E_USER_PASSWORD is empty. Define it as a secret on the $E2E_ENVIRONMENT environment and pass it from the caller."
-            exit 1
-          fi
-          echo "e2e user secret present for $E2E_ENVIRONMENT."
 
       - name: Read the installed playwright version
         id: playwright-version
@@ -298,7 +477,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-browser-${{ inputs.environment }}
+          name: e2e-browser-${{ needs.gate.outputs.environment }}
           path: ${{ inputs.working-directory }}/e2e-browser-artifacts
           retention-days: 7
           if-no-files-found: ignore
@@ -307,7 +486,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-junit-${{ inputs.environment }}
+          name: e2e-junit-${{ needs.gate.outputs.environment }}
           path: ${{ inputs.working-directory }}/e2e-results.xml
           retention-days: 7
           if-no-files-found: ignore
