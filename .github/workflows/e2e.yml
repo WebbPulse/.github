@@ -148,9 +148,12 @@ on:
       role-to-assume:
         description: "IAM role ARN assumed via OIDC to read the gateway, the access log and the gate parameter."
         required: true
+      E2E_USER_PASSWORD:
+        description: "Password of the durable e2e user. Define it as an Environment secret; the job runs under the target environment, so that value is the one read. Masked by GitHub and never echoed."
+        required: false
       e2e-user-password:
-        description: "Password of the durable e2e user. Masked by GitHub and never echoed."
-        required: true
+        description: "Deprecated name for E2E_USER_PASSWORD, read only when the new name is empty."
+        required: false
       codeartifact-domain-owner:
         description: "AWS account id that owns the CodeArtifact domain."
         required: false
@@ -181,7 +184,7 @@ jobs:
       E2E_BROWSER: ${{ inputs.browser }}
       E2E_HEADLESS: ${{ inputs.headless }}
       E2E_USER_EMAIL: ${{ inputs.user-email }}
-      E2E_USER_PASSWORD: ${{ secrets.e2e-user-password }}
+      E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD != '' && secrets.E2E_USER_PASSWORD || secrets.e2e-user-password }}
       E2E_MINT_ENABLED: ${{ inputs.mint-enabled }}
       E2E_KMS_KEY_ID: ${{ inputs.kms-key-id }}
       E2E_ISSUER: ${{ inputs.issuer }}
@@ -244,22 +247,37 @@ jobs:
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
+      - name: Check the e2e user secret is present
+        run: |
+          set -euo pipefail
+          if [ -z "$E2E_USER_PASSWORD" ]; then
+            echo "::error::E2E_USER_PASSWORD is empty. Define it as a secret on the $E2E_ENVIRONMENT environment and pass it from the caller."
+            exit 1
+          fi
+          echo "e2e user secret present for $E2E_ENVIRONMENT."
+
       - name: Read the installed playwright version
         id: playwright-version
         working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          VERSION=$(python -c "import playwright; print(playwright.__version__)")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "playwright $VERSION"
+          if VERSION=$(python -c "import playwright; print(playwright.__version__)" 2>/dev/null); then
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "playwright $VERSION"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "::notice::playwright is not in the e2e group, so the browser groups are skipped."
+          fi
 
       - name: Restore the playwright browser cache
+        if: steps.playwright-version.outputs.version != ''
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: ms-playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}-${{ inputs.browser }}
 
       - name: Install the browser
+        if: steps.playwright-version.outputs.version != ''
         working-directory: ${{ inputs.working-directory }}
         env:
           E2E_BROWSER: ${{ inputs.browser }}
