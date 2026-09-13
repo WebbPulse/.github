@@ -40,6 +40,24 @@ on:
         type: string
         required: false
         default: ""
+      gate-signing-key-ssm-parameter:
+        description: >-
+          SSM SecureString parameter holding the staging access gate signing key. The suite
+          reads it itself with boto3 to mint CloudFront signed cookies, so the PEM never
+          reaches the workflow. Empty means no web gate, which is what production passes.
+        type: string
+        required: false
+        default: ""
+      gate-key-pair-id:
+        description: "CloudFront public key id the minted gate cookies name. Empty means no web gate."
+        type: string
+        required: false
+        default: ""
+      gate-cookie-domain:
+        description: "Domain the minted gate cookies are scoped to, the staging apex. Empty means no web gate."
+        type: string
+        required: false
+        default: ""
       user-email:
         description: "Address of the durable e2e user, normally a GitHub Environment variable."
         type: string
@@ -69,21 +87,16 @@ on:
         type: string
         required: false
         default: ""
-      playwright-directory:
-        description: "Frontend project root holding the Playwright suite. Empty skips the browser phase."
+      browser:
+        description: "Playwright browser the suite drives, chromium, firefox or webkit."
         type: string
         required: false
-        default: ""
-      playwright-command:
-        description: "Command that runs the Playwright suite inside playwright-directory."
-        type: string
+        default: "chromium"
+      headless:
+        description: "Run the browser headless."
+        type: boolean
         required: false
-        default: "npx playwright test"
-      node-version:
-        description: "Node version for the Playwright phase."
-        type: string
-        required: false
-        default: "22"
+        default: true
       check-name:
         description: "Name of the published check run. Empty derives `e2e (<environment>)`."
         type: string
@@ -162,6 +175,11 @@ jobs:
       E2E_API_ID: ${{ inputs.api-id }}
       E2E_ACCESS_LOG_GROUP: ${{ inputs.access-log-group }}
       E2E_GATE_SSM_PARAMETER: ${{ inputs.gate-ssm-parameter }}
+      E2E_GATE_SIGNING_KEY_SSM_PARAMETER: ${{ inputs.gate-signing-key-ssm-parameter }}
+      E2E_GATE_KEY_PAIR_ID: ${{ inputs.gate-key-pair-id }}
+      E2E_GATE_COOKIE_DOMAIN: ${{ inputs.gate-cookie-domain }}
+      E2E_BROWSER: ${{ inputs.browser }}
+      E2E_HEADLESS: ${{ inputs.headless }}
       E2E_USER_EMAIL: ${{ inputs.user-email }}
       E2E_USER_PASSWORD: ${{ secrets.e2e-user-password }}
       E2E_MINT_ENABLED: ${{ inputs.mint-enabled }}
@@ -226,8 +244,29 @@ jobs:
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
-      - name: Run the API suite
-        id: api-suite
+      - name: Read the installed playwright version
+        id: playwright-version
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python -c "import playwright; print(playwright.__version__)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "playwright $VERSION"
+
+      - name: Restore the playwright browser cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}-${{ inputs.browser }}
+
+      - name: Install the browser
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          E2E_BROWSER: ${{ inputs.browser }}
+        run: python -m playwright install --with-deps "$E2E_BROWSER"
+
+      - name: Run the suite
+        id: suite
         working-directory: ${{ inputs.working-directory }}
         env:
           E2E_DIRECTORY: ${{ inputs.e2e-directory }}
@@ -237,38 +276,12 @@ jobs:
             --junitxml=e2e-results.xml \
             ${{ inputs.pytest-args }}
 
-      - name: Set up Node
-        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: npm
-          cache-dependency-path: ${{ inputs.playwright-directory }}/package-lock.json
-
-      - name: Install the Playwright project
-        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
-        working-directory: ${{ inputs.playwright-directory }}
-        run: npm ci
-
-      - name: Install the chromium browser
-        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
-        working-directory: ${{ inputs.playwright-directory }}
-        run: npx playwright install --with-deps chromium
-
-      - name: Run the Playwright suite
-        id: playwright
-        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
-        working-directory: ${{ inputs.playwright-directory }}
-        run: ${{ inputs.playwright-command }}
-
-      - name: Upload the Playwright report
-        if: ${{ failure() && inputs.playwright-directory != '' }}
+      - name: Upload the browser artifacts
+        if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: playwright-report-${{ inputs.environment }}
-          path: |
-            ${{ inputs.playwright-directory }}/playwright-report
-            ${{ inputs.playwright-directory }}/test-results
+          name: e2e-browser-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}/e2e-browser-artifacts
           retention-days: 7
           if-no-files-found: ignore
 
@@ -285,8 +298,7 @@ jobs:
         if: always()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
-          API_OUTCOME: ${{ steps.api-suite.outcome }}
-          PLAYWRIGHT_OUTCOME: ${{ steps.playwright.outcome }}
+          SUITE_OUTCOME: ${{ steps.suite.outcome }}
           JOB_STATUS: ${{ job.status }}
         with:
           script: |
@@ -347,22 +359,18 @@ jobs:
             const junitPath = process.env.JUNIT_PATH;
             const xml = readJunit(junitPath);
             const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-            const apiOutcome = process.env.API_OUTCOME || "skipped";
-            const playwrightOutcome = process.env.PLAYWRIGHT_OUTCOME || "skipped";
+            const suiteOutcome = process.env.SUITE_OUTCOME || "skipped";
             const jobStatus = process.env.JOB_STATUS;
             const conclusion = jobStatus === "success" ? "success" : jobStatus === "cancelled" ? "cancelled" : "failure";
 
             const lines = [];
             lines.push(`[View the workflow run](${runUrl})`);
             lines.push("");
-            lines.push("| Phase | Result |");
-            lines.push("| --- | --- |");
-            lines.push(`| API suite | ${apiOutcome} |`);
-            lines.push(`| Playwright | ${playwrightOutcome} |`);
+            lines.push(`Suite: ${suiteOutcome}.`);
             lines.push("");
 
             if (xml === null) {
-              lines.push(`No junit report was written to \`${path.basename(junitPath)}\`, so the API suite did not reach the reporting stage.`);
+              lines.push(`No junit report was written to \`${path.basename(junitPath)}\`, so the suite did not reach the reporting stage.`);
             } else {
               const counts = totals(xml);
               lines.push(`Tests: ${counts.tests}, failures: ${counts.failures}, errors: ${counts.errors}, skipped: ${counts.skipped}.`);

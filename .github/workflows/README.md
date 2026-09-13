@@ -657,20 +657,29 @@ What it checks, through the real edge rather than a mock:
 - **Frontend.** The web origin serves the app shell, a bad path still renders it, the bundle
   references the configured API base URL and none of the legacy route names, and a CORS
   preflight from the web origin allows the headers the shared client sends.
-- **Playwright**, when `playwright-directory` is set, against the deployed origin.
+- **Browser.** Playwright for Python drives the deployed origin: sign in and sign out through
+  the real UI, route guard behaviour, every declared route rendering clean, and each
+  product-declared journey.
 
 The suite lives in `webbpulse.e2e` and in each product's `e2e/` directory; this workflow only
-supplies the environment and reports the result.
+supplies the environment and reports the result. The API and browser groups are one pytest
+run, so there is a single suite step.
 
 **Secrets stay out of the log.** The workflow never reads the gate value: it passes the SSM
 parameter name as `E2E_GATE_SSM_PARAMETER` and the suite reads the SecureString itself with
 boto3 at run time. The e2e user's password arrives as a secret, so GitHub masks it.
 
+**The gate cookie inputs.** The staging web origin sits behind the access gate, so browser and
+frontend requests need minted CloudFront signed cookies. `gate-signing-key-ssm-parameter`,
+`gate-key-pair-id` and `gate-cookie-domain` carry what the suite needs to mint them, and the
+signing key is read from SSM by the suite so the PEM never reaches the workflow. All three are
+empty in production, which has no gate.
+
 **The check run is always published.** The last step runs under `if: always()` with
 `checks: write` and creates a check named `check-name` on the `sha` input, defaulting to the
-caller's `github.sha`. Its summary links the run, tabulates the API and Playwright phases, and
-lists the failed test ids parsed out of the junit report when one was written. The job itself
-still fails on a red suite, so the deploy workflow goes red and GitHub notifies.
+caller's `github.sha`. Its summary links the run, reports the suite outcome, and lists the
+failed test ids parsed out of the junit report when one was written. The job itself still
+fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -682,15 +691,17 @@ still fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | `api-id` | string | required | API Gateway v2 api id, normally a terraform output. |
 | `access-log-group` | string | required | Gateway access log group. |
 | `gate-ssm-parameter` | string | `""` | Staging gate parameter name. Empty skips the gate. |
+| `gate-signing-key-ssm-parameter` | string | `""` | Gate signing key parameter. Empty means no web gate. |
+| `gate-key-pair-id` | string | `""` | CloudFront public key id for the minted cookies. |
+| `gate-cookie-domain` | string | `""` | Domain the minted cookies are scoped to. |
 | `user-email` | string | required | Durable e2e user, from the environment's `vars`. |
 | `working-directory` | string | `.` | Python project root with `pyproject.toml` and `uv.lock`. |
 | `e2e-directory` | string | `e2e` | Directory pytest collects, relative to `working-directory`. |
 | `install-command` | string | `uv sync --locked --only-group e2e` | |
 | `python-version` | string | `3.13` | |
 | `pytest-args` | string | `""` | |
-| `playwright-directory` | string | `""` | Empty skips the browser phase. |
-| `playwright-command` | string | `npx playwright test` | |
-| `node-version` | string | `22` | |
+| `browser` | string | `chromium` | Playwright browser the suite drives. |
+| `headless` | boolean | `true` | Run the browser headless. |
 | `check-name` | string | `""` | Empty derives `e2e (<environment>)`. |
 | `legacy-route-names` | string | `""` | Comma separated, must not appear in the bundle. |
 | `mint-enabled` | boolean | `false` | Staging only. `mint_test_token` refuses production itself. |
@@ -728,9 +739,11 @@ jobs:
       api-id: ${{ vars.API_ID }}
       access-log-group: ${{ vars.API_ACCESS_LOG_GROUP }}
       gate-ssm-parameter: ${{ vars.GATE_SSM_PARAMETER }}
+      gate-signing-key-ssm-parameter: ${{ vars.GATE_SIGNING_KEY_SSM_PARAMETER }}
+      gate-key-pair-id: ${{ vars.GATE_KEY_PAIR_ID }}
+      gate-cookie-domain: ${{ vars.GATE_COOKIE_DOMAIN }}
       user-email: ${{ vars.E2E_USER_EMAIL }}
       working-directory: backend
-      playwright-directory: frontend
       legacy-route-names: ${{ vars.LEGACY_ROUTE_NAMES }}
       mint-enabled: ${{ vars.E2E_MINT_ENABLED == 'true' }}
       kms-key-id: ${{ vars.IDENTITY_KMS_KEY_ID }}
