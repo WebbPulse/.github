@@ -230,9 +230,11 @@ jobs:
           set -euo pipefail
 
           emit() {
-            echo "run=$1" >> "$GITHUB_OUTPUT"
-            echo "sha=$2" >> "$GITHUB_OUTPUT"
-            echo "environment=$3" >> "$GITHUB_OUTPUT"
+            {
+              echo "run=$1"
+              echo "sha=$2"
+              echo "environment=$3"
+            } >> "$GITHUB_OUTPUT"
           }
 
           derive_environment() {
