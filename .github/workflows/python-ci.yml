@@ -4,27 +4,20 @@ on:
   workflow_call:
     inputs:
       python-version:
-        description: "Python version to set up."
+        description: "Python version uv provisions for the project environment."
         type: string
         required: false
         default: "3.13"
       working-directory:
-        description: "Directory holding the Python project (pyproject.toml, requirements files)."
+        description: "Directory holding the Python project (pyproject.toml, uv.lock)."
         type: string
         required: false
         default: "backend"
       install-command:
-        description: "Command used to install dependencies, run inside working-directory."
+        description: "Command used to install dependencies with uv, run inside working-directory."
         type: string
         required: false
-        default: "python -m pip install --upgrade pip && pip install -r requirements-dev.txt"
-      cache-dependency-path:
-        description: >-
-          Dependency file glob for the setup-python pip cache. Empty derives every
-          requirements*.txt and pyproject.toml under working-directory.
-        type: string
-        required: false
-        default: ""
+        default: "uv sync --locked"
       ruff-target:
         description: "Paths passed to ruff check and ruff format. Empty skips both."
         type: string
@@ -44,14 +37,15 @@ on:
       security-commands:
         description: >-
           Security scan commands, one per line, run in their own job. For example
-          `bandit -r app -ll` and `pip-audit -r requirements.txt`.
+          `bandit -r app -ll` and `uv export --frozen --no-dev --no-emit-project --no-hashes
+          -o /tmp/requirements-audit.txt && pip-audit --no-deps -r /tmp/requirements-audit.txt`.
         type: string
         required: false
         default: ""
       pytest-args:
         description: >-
-          Extra arguments appended to every pytest invocation. Never paths when domains are
-          declared, since those would apply to every job.
+          Extra arguments appended to every pytest invocation. Never paths, since those would
+          apply to every job.
         type: string
         required: false
         default: ""
@@ -80,17 +74,19 @@ on:
         required: false
         default: "ubuntu-latest"
       codeartifact-domain:
-        description: "CodeArtifact domain. Leave empty to skip the CodeArtifact login step."
+        description: "CodeArtifact domain. Leave empty to skip the CodeArtifact auth step."
         type: string
         required: false
         default: ""
-      codeartifact-repository:
-        description: "CodeArtifact repository name. Required when codeartifact-domain is set."
+      codeartifact-index:
+        description: >-
+          Name of the `[[tool.uv.index]]` entry the token authenticates, which decides the
+          UV_INDEX_<NAME>_USERNAME and UV_INDEX_<NAME>_PASSWORD variables that carry it.
         type: string
         required: false
-        default: ""
+        default: "codeartifact"
       aws-region:
-        description: "AWS region for the CodeArtifact login."
+        description: "AWS region for the CodeArtifact token."
         type: string
         required: false
         default: ""
@@ -124,7 +120,7 @@ jobs:
           python-version: ${{ inputs.python-version }}
 
       - id: domains
-        name: Read the declared domains
+        name: Discover the test domains
         working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
@@ -134,33 +130,57 @@ jobs:
           import sys
           import tomllib
 
+          table = {}
           path = pathlib.Path("pyproject.toml")
-          if not path.is_file():
-              print("[]")
-              sys.exit(0)
+          if path.is_file():
+              with path.open("rb") as handle:
+                  document = tomllib.load(handle)
+              table = document.get("tool", {}).get("webbpulse", {}).get("ci", {})
 
-          with path.open("rb") as handle:
-              document = tomllib.load(handle)
+          if "domains" in table:
+              print(
+                  "[tool.webbpulse.ci.domains] is no longer supported in v3. Domains are the "
+                  "immediate subdirectories of domains-root (default '<test-root>/domains') "
+                  "that contain tests. Move each domain's tests under that directory and "
+                  "delete the table.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
 
-          table = document.get("tool", {}).get("webbpulse", {}).get("ci", {})
-          domains = table.get("domains", {})
-          if not isinstance(domains, dict):
-              print("[tool.webbpulse.ci.domains] must be a table", file=sys.stderr)
-              sys.exit(1)
-          if "shared" in domains:
-              print("'shared' is reserved for the job carrying unclaimed tests", file=sys.stderr)
-              sys.exit(1)
-          for name, paths in domains.items():
-              if not isinstance(paths, list) or not paths:
-                  print(f"domain {name!r} must claim a non-empty list of paths", file=sys.stderr)
+          test_root = table.get("test-root", "tests")
+          domains_root = pathlib.Path(table.get("domains-root", f"{test_root}/domains"))
+          entrypoints = table.get("entrypoints", "")
+
+          domains = []
+          if domains_root.is_dir():
+              for candidate in sorted(p for p in domains_root.iterdir() if p.is_dir()):
+                  if any(candidate.rglob("test_*.py")) or any(candidate.rglob("*_test.py")):
+                      domains.append(candidate.name)
+
+          if domains and entrypoints:
+              root = pathlib.Path(entrypoints)
+              missing = [
+                  name
+                  for name in domains
+                  if not (root / f"{name.replace('-', '_')}.py").is_file()
+              ]
+              if missing:
+                  existing = sorted(p.stem for p in root.glob("*.py")) if root.is_dir() else []
+                  print(
+                      "test domain directories with no matching entrypoint module under "
+                      f"{entrypoints}: {', '.join(missing)}. Modules that do exist: "
+                      f"{', '.join(existing) or '(none)'}",
+                      file=sys.stderr,
+                  )
                   sys.exit(1)
-          print(json.dumps(sorted(domains)))
+
+          print(json.dumps(domains))
           PY
           )
           echo "domains=$DOMAINS" >> "$GITHUB_OUTPUT"
           if [ "$DOMAINS" = "[]" ]; then
             echo "has-domains=false" >> "$GITHUB_OUTPUT"
-            echo "No domains declared. The shared job will carry the whole suite."
+            echo "No test domain directories found. The shared job will carry the whole suite."
           else
             echo "has-domains=true" >> "$GITHUB_OUTPUT"
             echo "Domains: $DOMAINS"
@@ -182,12 +202,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
+          version: "0.12.10"
           python-version: ${{ inputs.python-version }}
-          cache: pip
-          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
 
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
@@ -196,21 +217,34 @@ jobs:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Log in to CodeArtifact for pip
+      - name: Authenticate the CodeArtifact index for uv
         if: inputs.codeartifact-domain != ''
         env:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
-          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_INDEX: ${{ inputs.codeartifact-index }}
         run: |
-          aws codeartifact login \
-            --tool pip \
+          set -euo pipefail
+          INDEX=$(echo "$CODEARTIFACT_INDEX" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')
+          INDEX=${INDEX%_}
+          TOKEN=$(aws codeartifact get-authorization-token \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY"
+            --query authorizationToken \
+            --output text)
+          echo "::add-mask::$TOKEN"
+          echo "UV_INDEX_${INDEX}_USERNAME=aws" >> "$GITHUB_ENV"
+          echo "UV_INDEX_${INDEX}_PASSWORD=$TOKEN" >> "$GITHUB_ENV"
+          echo "Authenticated the $CODEARTIFACT_INDEX index."
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
+
+      - name: Activate the project environment
+        run: |
+          set -euo pipefail
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
       - name: Ruff check
         if: inputs.ruff-target != ''
@@ -249,12 +283,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
+          version: "0.12.10"
           python-version: ${{ inputs.python-version }}
-          cache: pip
-          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
 
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
@@ -263,21 +298,34 @@ jobs:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Log in to CodeArtifact for pip
+      - name: Authenticate the CodeArtifact index for uv
         if: inputs.codeartifact-domain != ''
         env:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
-          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_INDEX: ${{ inputs.codeartifact-index }}
         run: |
-          aws codeartifact login \
-            --tool pip \
+          set -euo pipefail
+          INDEX=$(echo "$CODEARTIFACT_INDEX" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')
+          INDEX=${INDEX%_}
+          TOKEN=$(aws codeartifact get-authorization-token \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY"
+            --query authorizationToken \
+            --output text)
+          echo "::add-mask::$TOKEN"
+          echo "UV_INDEX_${INDEX}_USERNAME=aws" >> "$GITHUB_ENV"
+          echo "UV_INDEX_${INDEX}_PASSWORD=$TOKEN" >> "$GITHUB_ENV"
+          echo "Authenticated the $CODEARTIFACT_INDEX index."
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
+
+      - name: Activate the project environment
+        run: |
+          set -euo pipefail
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
       - name: Type check
         run: ${{ inputs.typecheck-command }}
@@ -298,12 +346,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
+          version: "0.12.10"
           python-version: ${{ inputs.python-version }}
-          cache: pip
-          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
 
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
@@ -312,21 +361,34 @@ jobs:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Log in to CodeArtifact for pip
+      - name: Authenticate the CodeArtifact index for uv
         if: inputs.codeartifact-domain != ''
         env:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
-          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_INDEX: ${{ inputs.codeartifact-index }}
         run: |
-          aws codeartifact login \
-            --tool pip \
+          set -euo pipefail
+          INDEX=$(echo "$CODEARTIFACT_INDEX" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')
+          INDEX=${INDEX%_}
+          TOKEN=$(aws codeartifact get-authorization-token \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY"
+            --query authorizationToken \
+            --output text)
+          echo "::add-mask::$TOKEN"
+          echo "UV_INDEX_${INDEX}_USERNAME=aws" >> "$GITHUB_ENV"
+          echo "UV_INDEX_${INDEX}_PASSWORD=$TOKEN" >> "$GITHUB_ENV"
+          echo "Authenticated the $CODEARTIFACT_INDEX index."
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
+
+      - name: Activate the project environment
+        run: |
+          set -euo pipefail
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
       - name: Security scans
         env:
@@ -361,12 +423,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
+          version: "0.12.10"
           python-version: ${{ inputs.python-version }}
-          cache: pip
-          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
 
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
@@ -375,21 +438,34 @@ jobs:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Log in to CodeArtifact for pip
+      - name: Authenticate the CodeArtifact index for uv
         if: inputs.codeartifact-domain != ''
         env:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
-          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_INDEX: ${{ inputs.codeartifact-index }}
         run: |
-          aws codeartifact login \
-            --tool pip \
+          set -euo pipefail
+          INDEX=$(echo "$CODEARTIFACT_INDEX" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')
+          INDEX=${INDEX%_}
+          TOKEN=$(aws codeartifact get-authorization-token \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY"
+            --query authorizationToken \
+            --output text)
+          echo "::add-mask::$TOKEN"
+          echo "UV_INDEX_${INDEX}_USERNAME=aws" >> "$GITHUB_ENV"
+          echo "UV_INDEX_${INDEX}_PASSWORD=$TOKEN" >> "$GITHUB_ENV"
+          echo "Authenticated the $CODEARTIFACT_INDEX index."
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
+
+      - name: Activate the project environment
+        run: |
+          set -euo pipefail
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
       - name: Apply the test environment
         env:
@@ -416,20 +492,20 @@ jobs:
           set -euo pipefail
           PATHS=$(python3 - <<'PY'
           import os
+          import pathlib
           import shlex
-          import sys
           import tomllib
 
-          with open("pyproject.toml", "rb") as handle:
-              table = tomllib.load(handle)["tool"]["webbpulse"]["ci"]
+          table = {}
+          path = pathlib.Path("pyproject.toml")
+          if path.is_file():
+              with path.open("rb") as handle:
+                  document = tomllib.load(handle)
+              table = document.get("tool", {}).get("webbpulse", {}).get("ci", {})
 
-          domains = table["domains"]
-          name = os.environ["DOMAIN"]
-          try:
-              print(" ".join(shlex.quote(p) for p in domains[name]))
-          except KeyError:
-              print(f"unknown domain {name!r}", file=sys.stderr)
-              sys.exit(1)
+          test_root = table.get("test-root", "tests")
+          domains_root = table.get("domains-root", f"{test_root}/domains")
+          print(shlex.quote(f"{domains_root}/{os.environ['DOMAIN']}"))
           PY
           )
           echo "Running: $PATHS"
@@ -472,12 +548,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
+          version: "0.12.10"
           python-version: ${{ inputs.python-version }}
-          cache: pip
-          cache-dependency-path: ${{ inputs.cache-dependency-path != '' && inputs.cache-dependency-path || format('{0}/requirements*.txt{1}{0}/pyproject.toml', inputs.working-directory, '\n') }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
 
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
@@ -486,21 +563,34 @@ jobs:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Log in to CodeArtifact for pip
+      - name: Authenticate the CodeArtifact index for uv
         if: inputs.codeartifact-domain != ''
         env:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
-          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_INDEX: ${{ inputs.codeartifact-index }}
         run: |
-          aws codeartifact login \
-            --tool pip \
+          set -euo pipefail
+          INDEX=$(echo "$CODEARTIFACT_INDEX" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')
+          INDEX=${INDEX%_}
+          TOKEN=$(aws codeartifact get-authorization-token \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY"
+            --query authorizationToken \
+            --output text)
+          echo "::add-mask::$TOKEN"
+          echo "UV_INDEX_${INDEX}_USERNAME=aws" >> "$GITHUB_ENV"
+          echo "UV_INDEX_${INDEX}_PASSWORD=$TOKEN" >> "$GITHUB_ENV"
+          echo "Authenticated the $CODEARTIFACT_INDEX index."
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
+
+      - name: Activate the project environment
+        run: |
+          set -euo pipefail
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
       - name: Apply the test environment
         env:
@@ -519,7 +609,7 @@ jobs:
           print("Applied test environment keys: " + ", ".join(sorted(values)))
           PY
 
-      - name: Pytest for everything no domain claims
+      - name: Pytest for everything outside the domain directories
         env:
           PYTEST_WORKERS: ${{ inputs.pytest-workers }}
         run: |
@@ -537,8 +627,10 @@ jobs:
               table = document.get("tool", {}).get("webbpulse", {}).get("ci", {})
 
           test_root = table.get("test-root", "tests")
-          claimed = sorted({p for paths in table.get("domains", {}).values() for p in paths})
-          args = [test_root, *(f"--ignore={p}" for p in claimed)]
+          domains_root = table.get("domains-root", f"{test_root}/domains")
+          args = [test_root]
+          if pathlib.Path(domains_root).is_dir():
+              args.append(f"--ignore={domains_root}")
           print(" ".join(shlex.quote(a) for a in args))
           PY
           )
@@ -571,7 +663,7 @@ jobs:
           print("## Python coverage (shared job)")
           print()
           print("Domain jobs upload their own reports as artifacts. This figure covers the")
-          print("tests no domain claims, so it is a floor rather than the suite total.")
+          print("tests outside the domain directories, so it is a floor rather than the suite total.")
           print()
           print("| Metric | Value |")
           print("| --- | --- |")
