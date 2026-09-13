@@ -1,0 +1,393 @@
+name: End-to-end verification
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment name, staging or production. Also the GitHub Environment the job runs in."
+        type: string
+        required: true
+      sha:
+        description: "Commit the check run is published on. Defaults to the caller's github.sha, which is the deployed commit."
+        type: string
+        required: false
+        default: ""
+      api-base-url:
+        description: "Base URL of the deployed API, for example https://api.staging.example.com."
+        type: string
+        required: true
+      web-base-url:
+        description: "Base URL of the deployed web origin."
+        type: string
+        required: true
+      aws-region:
+        description: "AWS region holding the gateway, the access log group and the identity key."
+        type: string
+        required: true
+      api-id:
+        description: "API Gateway v2 api id, used to read the live route table."
+        type: string
+        required: true
+      access-log-group:
+        description: "CloudWatch log group carrying the gateway access log."
+        type: string
+        required: true
+      gate-ssm-parameter:
+        description: >-
+          SSM SecureString parameter holding the staging x-origin-verify value. The suite reads
+          it itself with boto3, so the value never reaches the workflow. Empty skips the gate,
+          which is what production passes.
+        type: string
+        required: false
+        default: ""
+      user-email:
+        description: "Address of the durable e2e user, normally a GitHub Environment variable."
+        type: string
+        required: true
+      working-directory:
+        description: "Python project root holding pyproject.toml and uv.lock."
+        type: string
+        required: false
+        default: "."
+      e2e-directory:
+        description: "Directory pytest collects, relative to working-directory."
+        type: string
+        required: false
+        default: "e2e"
+      install-command:
+        description: "Command used to install the e2e dependency group with uv."
+        type: string
+        required: false
+        default: "uv sync --locked --only-group e2e"
+      python-version:
+        description: "Python version uv provisions for the project environment."
+        type: string
+        required: false
+        default: "3.13"
+      pytest-args:
+        description: "Extra arguments appended to the pytest invocation."
+        type: string
+        required: false
+        default: ""
+      playwright-directory:
+        description: "Frontend project root holding the Playwright suite. Empty skips the browser phase."
+        type: string
+        required: false
+        default: ""
+      playwright-command:
+        description: "Command that runs the Playwright suite inside playwright-directory."
+        type: string
+        required: false
+        default: "npx playwright test"
+      node-version:
+        description: "Node version for the Playwright phase."
+        type: string
+        required: false
+        default: "22"
+      check-name:
+        description: "Name of the published check run. Empty derives `e2e (<environment>)`."
+        type: string
+        required: false
+        default: ""
+      legacy-route-names:
+        description: "Comma separated strings that must not appear in the deployed bundle."
+        type: string
+        required: false
+        default: ""
+      mint-enabled:
+        description: "Allow the suite to mint test tokens with KMS. Staging only, refused in production."
+        type: boolean
+        required: false
+        default: false
+      kms-key-id:
+        description: "Identity signing key used by mint_test_token."
+        type: string
+        required: false
+        default: ""
+      issuer:
+        description: "Expected token issuer for this environment."
+        type: string
+        required: false
+        default: ""
+      audience:
+        description: "Expected token audience for this environment."
+        type: string
+        required: false
+        default: ""
+      codeartifact-domain:
+        description: "CodeArtifact domain. Leave empty to skip the CodeArtifact auth step."
+        type: string
+        required: false
+        default: ""
+      codeartifact-index:
+        description: >-
+          Name of the `[[tool.uv.index]]` entry the token authenticates, which decides the
+          UV_INDEX_<NAME>_USERNAME and UV_INDEX_<NAME>_PASSWORD variables that carry it.
+        type: string
+        required: false
+        default: "codeartifact"
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC to read the gateway, the access log and the gate parameter."
+        required: true
+      e2e-user-password:
+        description: "Password of the durable e2e user. Masked by GitHub and never echoed."
+        required: true
+      codeartifact-domain-owner:
+        description: "AWS account id that owns the CodeArtifact domain."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e (${{ inputs.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      checks: write
+    env:
+      E2E_ENVIRONMENT: ${{ inputs.environment }}
+      E2E_API_BASE_URL: ${{ inputs.api-base-url }}
+      E2E_WEB_BASE_URL: ${{ inputs.web-base-url }}
+      E2E_AWS_REGION: ${{ inputs.aws-region }}
+      E2E_API_ID: ${{ inputs.api-id }}
+      E2E_ACCESS_LOG_GROUP: ${{ inputs.access-log-group }}
+      E2E_GATE_SSM_PARAMETER: ${{ inputs.gate-ssm-parameter }}
+      E2E_USER_EMAIL: ${{ inputs.user-email }}
+      E2E_USER_PASSWORD: ${{ secrets.e2e-user-password }}
+      E2E_MINT_ENABLED: ${{ inputs.mint-enabled }}
+      E2E_KMS_KEY_ID: ${{ inputs.kms-key-id }}
+      E2E_ISSUER: ${{ inputs.issuer }}
+      E2E_AUDIENCE: ${{ inputs.audience }}
+      E2E_RUN_ID: ${{ github.run_id }}
+      E2E_LEGACY_ROUTE_NAMES: ${{ inputs.legacy-route-names }}
+      AWS_REGION: ${{ inputs.aws-region }}
+      TARGET_SHA: ${{ inputs.sha != '' && inputs.sha || github.sha }}
+      CHECK_NAME: ${{ inputs.check-name != '' && inputs.check-name || format('e2e ({0})', inputs.environment) }}
+      JUNIT_PATH: ${{ inputs.working-directory }}/e2e-results.xml
+    steps:
+      - name: Check out the deployed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha != '' && inputs.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.10"
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/uv.lock
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ secrets.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Authenticate the CodeArtifact index for uv
+        if: inputs.codeartifact-domain != ''
+        env:
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
+          CODEARTIFACT_INDEX: ${{ inputs.codeartifact-index }}
+        run: |
+          set -euo pipefail
+          INDEX=$(echo "$CODEARTIFACT_INDEX" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_')
+          INDEX=${INDEX%_}
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --query authorizationToken \
+            --output text)
+          echo "::add-mask::$TOKEN"
+          echo "UV_INDEX_${INDEX}_USERNAME=aws" >> "$GITHUB_ENV"
+          echo "UV_INDEX_${INDEX}_PASSWORD=$TOKEN" >> "$GITHUB_ENV"
+          echo "Authenticated the $CODEARTIFACT_INDEX index."
+
+      - name: Install the e2e dependency group
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.install-command }}
+
+      - name: Activate the project environment
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+
+      - name: Run the API suite
+        id: api-suite
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          E2E_DIRECTORY: ${{ inputs.e2e-directory }}
+        run: |
+          set -euo pipefail
+          python -m pytest "$E2E_DIRECTORY" \
+            --junitxml=e2e-results.xml \
+            ${{ inputs.pytest-args }}
+
+      - name: Set up Node
+        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.playwright-directory }}/package-lock.json
+
+      - name: Install the Playwright project
+        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
+        working-directory: ${{ inputs.playwright-directory }}
+        run: npm ci
+
+      - name: Install the chromium browser
+        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
+        working-directory: ${{ inputs.playwright-directory }}
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the Playwright suite
+        id: playwright
+        if: ${{ always() && inputs.playwright-directory != '' && steps.api-suite.outcome != 'cancelled' }}
+        working-directory: ${{ inputs.playwright-directory }}
+        run: ${{ inputs.playwright-command }}
+
+      - name: Upload the Playwright report
+        if: ${{ failure() && inputs.playwright-directory != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report-${{ inputs.environment }}
+          path: |
+            ${{ inputs.playwright-directory }}/playwright-report
+            ${{ inputs.playwright-directory }}/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload the junit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-junit-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}/e2e-results.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Publish the check run
+        if: always()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          API_OUTCOME: ${{ steps.api-suite.outcome }}
+          PLAYWRIGHT_OUTCOME: ${{ steps.playwright.outcome }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            /** Read the junit file, returning null when the suite never produced one. */
+            function readJunit(file) {
+              try {
+                return fs.readFileSync(file, "utf8");
+              } catch {
+                return null;
+              }
+            }
+
+            /** Collect the ids of failed and errored test cases from a junit document. */
+            function failedTestIds(xml) {
+              const ids = [];
+              const casePattern = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
+              for (const match of xml.matchAll(casePattern)) {
+                const attributes = match[1];
+                const body = match[3] || "";
+                if (!/<(failure|error)\b/.test(body)) {
+                  continue;
+                }
+                const classname = /\bclassname="([^"]*)"/.exec(attributes);
+                const name = /\bname="([^"]*)"/.exec(attributes);
+                const parts = [];
+                if (classname && classname[1]) {
+                  parts.push(classname[1]);
+                }
+                if (name && name[1]) {
+                  parts.push(name[1]);
+                }
+                ids.push(parts.join("::") || "(unnamed test)");
+              }
+              return ids;
+            }
+
+            /** Count totals from the junit root or testsuite element. */
+            function totals(xml) {
+              const attribute = (key) => {
+                const pattern = new RegExp(`<testsuite\\b[^>]*?\\b${key}="(\\d+)"`, "g");
+                let sum = 0;
+                for (const match of xml.matchAll(pattern)) {
+                  sum += Number(match[1]);
+                }
+                return sum;
+              };
+              return {
+                tests: attribute("tests"),
+                failures: attribute("failures"),
+                errors: attribute("errors"),
+                skipped: attribute("skipped"),
+              };
+            }
+
+            const junitPath = process.env.JUNIT_PATH;
+            const xml = readJunit(junitPath);
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const apiOutcome = process.env.API_OUTCOME || "skipped";
+            const playwrightOutcome = process.env.PLAYWRIGHT_OUTCOME || "skipped";
+            const jobStatus = process.env.JOB_STATUS;
+            const conclusion = jobStatus === "success" ? "success" : jobStatus === "cancelled" ? "cancelled" : "failure";
+
+            const lines = [];
+            lines.push(`[View the workflow run](${runUrl})`);
+            lines.push("");
+            lines.push("| Phase | Result |");
+            lines.push("| --- | --- |");
+            lines.push(`| API suite | ${apiOutcome} |`);
+            lines.push(`| Playwright | ${playwrightOutcome} |`);
+            lines.push("");
+
+            if (xml === null) {
+              lines.push(`No junit report was written to \`${path.basename(junitPath)}\`, so the API suite did not reach the reporting stage.`);
+            } else {
+              const counts = totals(xml);
+              lines.push(`Tests: ${counts.tests}, failures: ${counts.failures}, errors: ${counts.errors}, skipped: ${counts.skipped}.`);
+              const failed = failedTestIds(xml);
+              if (failed.length > 0) {
+                lines.push("");
+                lines.push("### Failed tests");
+                lines.push("");
+                for (const id of failed) {
+                  lines.push(`- \`${id}\``);
+                }
+              }
+            }
+
+            const summary = lines.join("\n");
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: process.env.CHECK_NAME,
+              head_sha: process.env.TARGET_SHA,
+              status: "completed",
+              conclusion,
+              output: {
+                title: `${process.env.CHECK_NAME}: ${conclusion}`,
+                summary: summary.slice(0, 65000),
+              },
+            });
+            core.summary.addRaw(summary).write();
