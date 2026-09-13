@@ -638,6 +638,123 @@ jobs:
 
 ---
 
+## `e2e.yml`
+
+Verifies a **deployed** environment after its deploy jobs succeed, then publishes a check
+run on the deployed commit so a release pull request can require a green staging run.
+
+What it checks, through the real edge rather than a mock:
+
+- **Route cut.** Every live gateway route is exercised and the access log entry is read back,
+  so the assertion is that the expected `routeKey` and integration served the request.
+- **Coverage.** Every OpenAPI operation matches a live route key under API Gateway
+  precedence, with the authorizer attached exactly where the operation needs auth.
+- **Reachability.** Every parameterless operation is called anonymously and as the durable
+  e2e user, and the status must be one the specification declares, never a gateway 404, a
+  403 from the gate, or a 5xx.
+- **Identity.** Login, refresh, logout and JWKS, with the token's algorithm, issuer and
+  audience checked against this environment. Staging additionally exercises minted tokens.
+- **Frontend.** The web origin serves the app shell, a bad path still renders it, the bundle
+  references the configured API base URL and none of the legacy route names, and a CORS
+  preflight from the web origin allows the headers the shared client sends.
+- **Playwright**, when `playwright-directory` is set, against the deployed origin.
+
+The suite lives in `webbpulse.e2e` and in each product's `e2e/` directory; this workflow only
+supplies the environment and reports the result.
+
+**Secrets stay out of the log.** The workflow never reads the gate value: it passes the SSM
+parameter name as `E2E_GATE_SSM_PARAMETER` and the suite reads the SecureString itself with
+boto3 at run time. The e2e user's password arrives as a secret, so GitHub masks it.
+
+**The check run is always published.** The last step runs under `if: always()` with
+`checks: write` and creates a check named `check-name` on the `sha` input, defaulting to the
+caller's `github.sha`. Its summary links the run, tabulates the API and Playwright phases, and
+lists the failed test ids parsed out of the junit report when one was written. The job itself
+still fails on a red suite, so the deploy workflow goes red and GitHub notifies.
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `environment` | string | required | `staging` or `production`. Also the GitHub Environment. |
+| `sha` | string | `""` | Commit the check run lands on. Empty means `github.sha`. |
+| `api-base-url` | string | required | |
+| `web-base-url` | string | required | |
+| `aws-region` | string | required | |
+| `api-id` | string | required | API Gateway v2 api id, normally a terraform output. |
+| `access-log-group` | string | required | Gateway access log group. |
+| `gate-ssm-parameter` | string | `""` | Staging gate parameter name. Empty skips the gate. |
+| `user-email` | string | required | Durable e2e user, from the environment's `vars`. |
+| `working-directory` | string | `.` | Python project root with `pyproject.toml` and `uv.lock`. |
+| `e2e-directory` | string | `e2e` | Directory pytest collects, relative to `working-directory`. |
+| `install-command` | string | `uv sync --locked --only-group e2e` | |
+| `python-version` | string | `3.13` | |
+| `pytest-args` | string | `""` | |
+| `playwright-directory` | string | `""` | Empty skips the browser phase. |
+| `playwright-command` | string | `npx playwright test` | |
+| `node-version` | string | `22` | |
+| `check-name` | string | `""` | Empty derives `e2e (<environment>)`. |
+| `legacy-route-names` | string | `""` | Comma separated, must not appear in the bundle. |
+| `mint-enabled` | boolean | `false` | Staging only. `mint_test_token` refuses production itself. |
+| `kms-key-id` | string | `""` | |
+| `issuer` | string | `""` | |
+| `audience` | string | `""` | |
+| `codeartifact-domain` | string | `""` | Empty skips the CodeArtifact auth step. |
+| `codeartifact-index` | string | `codeartifact` | |
+| `runs-on` | string | `ubuntu-latest` | |
+
+| Secret | Required | Notes |
+| --- | --- | --- |
+| `role-to-assume` | yes | Reads the gateway, the access log group and the gate parameter. |
+| `e2e-user-password` | yes | Durable e2e user's password. Masked by GitHub. |
+| `codeartifact-domain-owner` | no | Required when `codeartifact-domain` is set. |
+
+Outputs: none. The result is the check run and the job conclusion.
+
+The caller adds an `e2e` job to its deploy workflow, needing the deploy job:
+
+```yaml
+jobs:
+  e2e:
+    needs: [resolve-env, deploy]
+    permissions:
+      contents: read
+      id-token: write
+      checks: write
+    uses: WebbPulse/.github/.github/workflows/e2e.yml@v3
+    with:
+      environment: ${{ needs.resolve-env.outputs.environment }}
+      api-base-url: ${{ vars.API_BASE_URL }}
+      web-base-url: ${{ vars.WEB_BASE_URL }}
+      aws-region: ${{ vars.AWS_REGION }}
+      api-id: ${{ vars.API_ID }}
+      access-log-group: ${{ vars.API_ACCESS_LOG_GROUP }}
+      gate-ssm-parameter: ${{ vars.GATE_SSM_PARAMETER }}
+      user-email: ${{ vars.E2E_USER_EMAIL }}
+      working-directory: backend
+      playwright-directory: frontend
+      legacy-route-names: ${{ vars.LEGACY_ROUTE_NAMES }}
+      mint-enabled: ${{ vars.E2E_MINT_ENABLED == 'true' }}
+      kms-key-id: ${{ vars.IDENTITY_KMS_KEY_ID }}
+      issuer: ${{ vars.IDENTITY_ISSUER }}
+      audience: ${{ vars.IDENTITY_AUDIENCE }}
+      codeartifact-domain: webbpulse
+    secrets:
+      role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+      e2e-user-password: ${{ secrets.E2E_USER_PASSWORD }}
+      codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
+```
+
+`checks: write` must be granted on the calling job, not only inside this workflow, because a
+reusable workflow can never hold a permission its caller did not.
+
+**Branch protection.** Add `e2e (staging)`, or whatever `check-name` resolves to on staging,
+to the required status checks on `main` in the product's ruleset. The staging deploy publishes
+that check on the commit it deployed, and the release pull request from `staging` to `main`
+carries the same commit, so a red staging run blocks promotion. Production runs publish
+`e2e (production)`, which is left off the required list: it reports after the fact, since
+there is nothing left to gate by then.
+
+---
+
 ## `codeartifact-publish-python.yml` and `codeartifact-publish-npm.yml`
 
 Build a shared package and publish it to CodeArtifact through OIDC into a role in
