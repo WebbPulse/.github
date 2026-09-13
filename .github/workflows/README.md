@@ -715,7 +715,7 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | Secret | Required | Notes |
 | --- | --- | --- |
 | `role-to-assume` | yes | Reads the gateway, the access log group and the gate parameter. |
-| `e2e-user-password` | yes | Durable e2e user's password. Masked by GitHub. |
+| `E2E_USER_PASSWORD` | yes | Durable e2e user's password. Define it as an Environment secret: the job runs under the target environment, so that value is the one read, and the repository-level value may stay unset. `e2e-user-password` is the deprecated name. |
 | `codeartifact-domain-owner` | no | Required when `codeartifact-domain` is set. |
 
 Outputs: none. The result is the check run and the job conclusion.
@@ -752,7 +752,7 @@ jobs:
       codeartifact-domain: webbpulse
     secrets:
       role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-      e2e-user-password: ${{ secrets.E2E_USER_PASSWORD }}
+      E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
       codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
 ```
 
