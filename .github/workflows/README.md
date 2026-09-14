@@ -907,6 +907,146 @@ it publishes `e2e (production)` after the fact and is never a required check.
 
 ---
 
+## `e2e-local.yml`
+
+Runs the same `webbpulse.e2e` suite as `e2e.yml`, but against a **local stack built from
+source on the runner** rather than a deployed environment. It is meant for pull requests, so
+a broken handler, a broken login, a broken bundle or a broken page is caught before the branch
+is deployed.
+
+The stack is three processes and no AWS runtime calls:
+
+- **DynamoDB Local** as a service container, published on `dynamodb-port` (8001 by default).
+- **The backend**, started from source by `backend-start-command`, which defaults to
+  `uv run uvicorn app.composition.app:app --host 127.0.0.1 --port 8000`. That is the composed
+  app carrying every domain on one port, which is contract equivalent to the deployed fan out
+  for everything the suite asserts locally.
+- **The SPA**, built by `frontend-build-command` and served by `preview-command`, which
+  defaults to `npx vite preview --host 127.0.0.1 --port 4173`.
+
+The only AWS the job touches is the existing OIDC plus CodeArtifact token exchange during the
+dependency install, because the shared `webbpulse` package and the `@webbpulse/*` npm scope
+have no public mirror. Everything else is local: no Secrets Manager, no KMS, no SES, no S3, no
+gateway, no SSM, no X-Ray.
+
+**What runs locally, and what stays post deploy.** The local run carries **Reachability**,
+**Identity** minus minting, **Frontend** and **Browser**. **Route cut** is skipped, since
+nothing local forwards an API Gateway request context and there is no access log group, and
+**Coverage** is degraded to comparing the OpenAPI document against a route table synthesized
+from that same document. Per domain isolation, the authorizer, the staging access gate, the
+stream consumers and the SQS work queues have no local analogue at all. A green local run is
+therefore not a substitute for `e2e (staging)`; the post deploy run stays required.
+
+**Secrets are the caller's.** This workflow generates no values. Every per run secret the
+stack needs, `SECRET_KEY` and the rest, arrives in `backend-env-json` from the caller. Those
+are local throwaway values for a stack that is destroyed with the runner, not real secrets, so
+the input appearing in the run log is the expected shape. Do not put a real secret in it.
+
+### The two rules that keep it non required
+
+- **Keep the calling job out of `all-checks-passed`'s `needs`.** That aggregator is the
+  required context in every product ruleset, so adding this job to it would make the local
+  suite required by the back door.
+- **The job never fails the caller.** The suite step is `continue-on-error: true`, the check
+  run is published with the suite's real conclusion, and the job then ends green. A red local
+  suite shows as a red `e2e (local)` check and a green job, so it reports without blocking.
+  A caller that wants the job itself to go red can set `continue-on-error` on its own side,
+  but then rule one is doing all the work.
+
+The check run is created through the API under `check-name`, so it is not one of the job's own
+statuses and never appears in branch protection unless someone adds it. On a `pull_request`
+event `head_sha` is `github.event.pull_request.head.sha`, not `github.sha`, which is the merge
+commit nobody is looking at.
+
+### Inputs
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `working-directory` | string | `backend` | Python project root with `pyproject.toml` and `uv.lock`. |
+| `e2e-directory` | string | `e2e` | Directory pytest collects, relative to `working-directory`. |
+| `install-command` | string | `uv sync --locked --group e2e` | Run in `working-directory`. |
+| `python-version` | string | `3.13` | |
+| `pytest-args` | string | `""` | A project whose `pytest.ini` pins `--cov` in `addopts` passes `-o addopts=`. |
+| `codeartifact-domain` | string | `""` | Empty skips both CodeArtifact auth steps. |
+| `codeartifact-index` | string | `codeartifact` | The `[[tool.uv.index]]` entry the token authenticates. |
+| `codeartifact-repository` | string | `""` | Empty skips the npm login. Required to resolve `@webbpulse/*`. |
+| `codeartifact-namespace` | string | `""` | npm scope to bind. Empty proxies all of public npm through CodeArtifact. |
+| `aws-region` | string | `us-west-2` | For the CodeArtifact token. The stack calls no AWS API. |
+| `node-version` | string | `22` | |
+| `frontend-directory` | string | `frontend` | Holds `package.json` and `package-lock.json`. |
+| `frontend-build-command` | string | `npm run build` | Run in `frontend-directory`. |
+| `frontend-build-env-json` | string | `{}` | Exported before the build, for the Vite variable carrying the local API base URL. |
+| `preview-command` | string | `npx vite preview --host 127.0.0.1 --port 4173` | Backgrounded in `frontend-directory`. |
+| `web-base-url` | string | `http://127.0.0.1:4173` | Must match `preview-command`. Becomes `E2E_WEB_BASE_URL`. |
+| `backend-env-json` | string | `{}` | The whole local stack configuration. See below. |
+| `backend-start-command` | string | `uv run uvicorn app.composition.app:app --host 127.0.0.1 --port 8000` | Backgrounded in `working-directory`. |
+| `api-base-url` | string | `http://127.0.0.1:8000` | Must match `backend-start-command`. Becomes `E2E_API_BASE_URL`. |
+| `health-path` | string | `/health` | Polled until 200, capped at 60 seconds. |
+| `table-bootstrap-command` | string | `""` | For example `uv run python scripts/create_dynamo_tables.py`. Empty skips the step. |
+| `dynamodb-image` | string | `amazon/dynamodb-local:latest` | The image's default command is already `-inMemory -sharedDb`. |
+| `dynamodb-port` | number | `8001` | Host port. `backend-env-json` must point at it. |
+| `browser` | string | `chromium` | |
+| `headless` | boolean | `true` | |
+| `check-name` | string | `e2e (local)` | |
+| `timeout-minutes` | number | `30` | |
+| `runs-on` | string | `ubuntu-latest` | |
+
+| Secret | Required | Notes |
+| --- | --- | --- |
+| `role-to-assume` | with `codeartifact-domain` | Reads CodeArtifact and nothing else. Empty reads `vars.CI_AWS_ROLE_ARN`. |
+| `codeartifact-domain-owner` | with `codeartifact-domain` | Empty reads `vars.CODEARTIFACT_DOMAIN_OWNER`. |
+
+Outputs: none. The result is the check run.
+
+### Environment the workflow sets itself
+
+`E2E_ENVIRONMENT=local`, `E2E_API_BASE_URL`, `E2E_WEB_BASE_URL`, `E2E_AWS_REGION`,
+`E2E_BROWSER`, `E2E_HEADLESS`, `E2E_READ_ONLY=false` and
+`E2E_RUN_ID=<run_id>-<run_attempt>`. `E2E_API_ID`, `E2E_ACCESS_LOG_GROUP`,
+`E2E_GATE_SSM_PARAMETER` and `E2E_MINT_ENABLED` are deliberately left unset, which is what
+selects the local behaviour in the plugin. `E2E_USER_EMAIL` and `E2E_USER_PASSWORD` come from
+`backend-env-json`, pointing at a user the product's own seed creates locally, not at the
+durable staging user.
+
+### The caller
+
+```yaml
+  e2e-local:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      checks: write
+    uses: WebbPulse/.github/.github/workflows/e2e-local.yml@v3
+    with:
+      working-directory: backend
+      frontend-directory: frontend
+      table-bootstrap-command: uv run python scripts/create_local_tables.py
+      pytest-args: "-o addopts="
+      codeartifact-domain: webbpulse
+      codeartifact-repository: webbpulse
+      codeartifact-namespace: "@webbpulse"
+      frontend-build-env-json: '{"VITE_API_BASE_URL": "http://127.0.0.1:8000/api/v1"}'
+      backend-env-json: ${{ vars.E2E_LOCAL_BACKEND_ENV }}
+    secrets:
+      role-to-assume: ${{ secrets.CI_AWS_ROLE_ARN }}
+      codeartifact-domain-owner: ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}
+```
+
+`checks: write` must be granted on the calling job, not only inside this workflow, because a
+reusable workflow can never hold a permission its caller did not. Gate the job on the existing
+`changes` job so a docs only pull request does not pay for it, and leave it out of
+`all-checks-passed`'s `needs`.
+
+Two traps the products hit. `vite preview` does not proxy, so the SPA must be built with a
+full `http://` API URL rather than a bare host, and the preview origin must be allowed by the
+backend's CORS configuration and be in the preview server's `allowedHosts`. And cookies must
+be usable over plain http, so the identity cookie has to be non secure with `samesite=lax`;
+`samesite=none` requires `secure`, which a plain http origin never sets.
+
+---
+
 ## `codeartifact-publish-python.yml` and `codeartifact-publish-npm.yml`
 
 Build a shared package and publish it to CodeArtifact through OIDC into a role in
