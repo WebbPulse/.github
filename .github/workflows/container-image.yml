@@ -228,6 +228,146 @@ jobs:
         if: steps.existing.outputs.exists != 'true'
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
+      - name: Resolve the base image from the Dockerfile
+        id: base
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "No Dockerfile at ${DOCKERFILE}. Leaving the base image to BuildKit."
+            exit 0
+          fi
+
+          case "$PLATFORM" in
+            *,*)
+              echo "platform holds more than one platform (${PLATFORM}). Skipping the base image cache."
+              exit 0
+              ;;
+          esac
+
+          OS="${PLATFORM%%/*}"
+          REST="${PLATFORM#*/}"
+          ARCH="${REST%%/*}"
+          VARIANT=""
+          case "$REST" in
+            */*) VARIANT="${REST#*/}" ;;
+          esac
+          if [ -z "$OS" ] || [ -z "$ARCH" ] || [ "$OS" = "$PLATFORM" ]; then
+            echo "Could not split ${PLATFORM} into an os and an architecture. Skipping the base image cache."
+            exit 0
+          fi
+
+          REF=$(sed -n 's/^[[:space:]]*ARG[[:space:]][[:space:]]*BASE_IMAGE=\(.*\)$/\1/p' "$DOCKERFILE" \
+            | head -n 1 \
+            | tr -d '"'"'"'"[:space:]')
+
+          if [ -z "$REF" ]; then
+            echo "No ARG BASE_IMAGE= default in ${DOCKERFILE}. Leaving the base image to BuildKit."
+            exit 0
+          fi
+
+          case "$REF" in
+            *@sha256:*) ;;
+            *)
+              echo "ARG BASE_IMAGE=${REF} is not pinned by digest. Skipping the base image cache."
+              exit 0
+              ;;
+          esac
+
+          BASE_DIGEST="${REF#*@}"
+          echo "Base image: ${REF}"
+          echo "Platform:   ${PLATFORM}"
+
+          {
+            echo "enabled=true"
+            echo "ref=${REF}"
+            echo "digest=${BASE_DIGEST}"
+            echo "os=${OS}"
+            echo "arch=${ARCH}"
+            echo "variant=${VARIANT}"
+            echo "layout-dir=${RUNNER_TEMP}/base-image-layout"
+            echo "cache-key=base-image-v1-$(printf '%s|%s' "$REF" "$PLATFORM" | sha256sum | cut -c1-64)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the base image layout
+        id: base-cache
+        if: steps.base.outputs.enabled == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.base.outputs.layout-dir }}
+          key: ${{ steps.base.outputs.cache-key }}
+
+      - name: Copy the base image into the layout
+        if: steps.base.outputs.enabled == 'true' && steps.base-cache.outputs.cache-hit != 'true'
+        env:
+          REF: ${{ steps.base.outputs.ref }}
+          LAYOUT_DIR: ${{ steps.base.outputs.layout-dir }}
+          OS: ${{ steps.base.outputs.os }}
+          ARCH: ${{ steps.base.outputs.arch }}
+          VARIANT: ${{ steps.base.outputs.variant }}
+        run: |
+          set -euo pipefail
+          rm -rf "$LAYOUT_DIR"
+          mkdir -p "$LAYOUT_DIR"
+
+          VARIANT_ARGS=""
+          if [ -n "$VARIANT" ]; then
+            VARIANT_ARGS="--override-variant $VARIANT"
+          fi
+
+          echo "Pulling ${REF} for ${OS}/${ARCH}${VARIANT:+/$VARIANT} from the registry."
+          # shellcheck disable=SC2086
+          skopeo copy \
+            --override-os "$OS" \
+            --override-arch "$ARCH" \
+            $VARIANT_ARGS \
+            --authfile "${DOCKER_CONFIG:-$HOME/.docker}/config.json" \
+            "docker://${REF}" \
+            "oci:${LAYOUT_DIR}:base"
+
+      - name: Save the base image layout
+        if: steps.base.outputs.enabled == 'true' && steps.base-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.base.outputs.layout-dir }}
+          key: ${{ steps.base.outputs.cache-key }}
+
+      - name: Resolve the layout manifest digest
+        id: layout
+        if: steps.base.outputs.enabled == 'true'
+        env:
+          LAYOUT_DIR: ${{ steps.base.outputs.layout-dir }}
+          REF: ${{ steps.base.outputs.ref }}
+        run: |
+          set -euo pipefail
+
+          echo "build-contexts=" >> "$GITHUB_OUTPUT"
+
+          if [ ! -f "${LAYOUT_DIR}/index.json" ]; then
+            echo "No OCI layout at ${LAYOUT_DIR}. Leaving the base image to BuildKit."
+            exit 0
+          fi
+
+          MANIFEST_DIGEST=$(jq -r '[.manifests[]
+            | select(.mediaType == "application/vnd.oci.image.manifest.v1+json"
+                  or .mediaType == "application/vnd.docker.distribution.manifest.v2+json")
+            | .digest] | first // empty' "${LAYOUT_DIR}/index.json")
+
+          if [ -z "$MANIFEST_DIGEST" ]; then
+            echo "The layout index holds no single platform manifest. Leaving the base image to BuildKit."
+            cat "${LAYOUT_DIR}/index.json"
+            exit 0
+          fi
+
+          echo "Serving ${REF} from ${LAYOUT_DIR} at ${MANIFEST_DIGEST}."
+          echo "build-contexts=${REF}=oci-layout://${LAYOUT_DIR}@${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
+
       - name: Mint a CodeArtifact token
         if: inputs.codeartifact-domain != '' && steps.existing.outputs.exists != 'true'
         env:
@@ -255,6 +395,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.platform }}
+          build-contexts: ${{ steps.layout.outputs.build-contexts }}
           push: true
           provenance: false
           sbom: false
