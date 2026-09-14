@@ -134,6 +134,11 @@ on:
         type: string
         required: false
         default: "chromium"
+      timeout-minutes:
+        description: "Minutes the suite job may run before GitHub cancels it, so a hung run never blocks the next one in the concurrency group."
+        type: number
+        required: false
+        default: 90
       headless:
         description: "Run the browser headless."
         type: boolean
@@ -368,6 +373,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     environment: ${{ needs.gate.outputs.environment }}
     permissions:
       contents: read
@@ -481,7 +487,7 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          if VERSION=$(python -c "import playwright; print(playwright.__version__)" 2>/dev/null); then
+          if VERSION=$(python -c "from importlib.metadata import version; print(version('playwright'))" 2>/dev/null); then
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "playwright $VERSION"
           else
