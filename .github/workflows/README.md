@@ -665,6 +665,17 @@ The suite lives in `webbpulse.e2e` and in each product's `e2e/` directory; this 
 supplies the environment and reports the result. The API and browser groups are one pytest
 run, so there is a single suite step.
 
+**Read-only production.** The full suite, sign in and browser journeys and every write
+included, runs against staging only. After a production deploy the same workflow runs a
+read-only smoke: anonymous, no sign in, no mutations, and no e2e user in production.
+`read-only-environments` lists the environments that run this way and defaults to
+`production`. When the environment the gate resolved is in that list the job exports
+`E2E_READ_ONLY=true` and the plugin skips every signed-in and mutating test; otherwise it
+exports `false`. In read-only mode `E2E_USER_EMAIL` and `E2E_USER_PASSWORD` are neither
+resolved nor required, so a production Environment with no e2e user and no password secret is
+the expected shape. The check run keeps the name `e2e (<environment>)` and its title and
+summary say `read-only`, so a reader of the production check knows what was verified.
+
 **Secrets stay out of the log.** The workflow never reads the gate value: it passes the SSM
 parameter name as `E2E_GATE_SSM_PARAMETER` and the suite reads the SecureString itself with
 boto3 at run time. The e2e user's password arrives as a secret, so GitHub masks it.
@@ -687,6 +698,7 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | `sha` | string | `""` | Commit the check run lands on. Empty lets the gate resolve it. |
 | `deploy-workflows` | string | `""` | Comma separated deploy workflow names, in ownership order. Empty disables the sibling wait. |
 | `production-branch` | string | `main` | Branch whose deploys mean production. |
+| `read-only-environments` | string | `production` | Comma separated environments that run read only. Sets `E2E_READ_ONLY`. |
 | `api-base-url` | string | `""` | Empty reads `vars.E2E_API_BASE_URL`. |
 | `web-base-url` | string | `""` | Empty reads `vars.E2E_WEB_BASE_URL`. |
 | `aws-region` | string | `us-west-2` | |
@@ -717,7 +729,7 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | Secret | Required | Notes |
 | --- | --- | --- |
 | `role-to-assume` | no | Reads the gateway, the access log group and the gate parameter. Empty reads `vars.AWS_DEPLOY_ROLE_ARN`. |
-| `E2E_USER_PASSWORD` | yes | Durable e2e user's password. Define it as an Environment secret: the job runs under the target environment, so that value is the one read, and the repository-level value may stay unset. `e2e-user-password` is the deprecated name. |
+| `E2E_USER_PASSWORD` | staging only | Durable e2e user's password. Define it as an Environment secret on staging: the job runs under the target environment, so that value is the one read, and the repository-level value may stay unset. Production is read only, so the secret is unset there and the caller's mapping simply resolves empty. `e2e-user-password` is the deprecated name. |
 | `codeartifact-domain-owner` | no | Required when `codeartifact-domain` is set. Empty reads `vars.CODEARTIFACT_DOMAIN_OWNER`. |
 
 Outputs: none. The result is the check run and the job conclusion.
@@ -803,7 +815,7 @@ variables and pass no value inputs at all.
 | --- | --- | --- |
 | `E2E_API_BASE_URL` | required | required |
 | `E2E_WEB_BASE_URL` | required | required |
-| `E2E_USER_EMAIL` | required | required |
+| `E2E_USER_EMAIL` | required | unset |
 | `AWS_DEPLOY_ROLE_ARN` | required | required |
 | `E2E_API_ID` | required | required |
 | `E2E_ACCESS_LOG_GROUP` | required | required |
@@ -818,7 +830,8 @@ variables and pass no value inputs at all.
 | `E2E_KMS_KEY_ID` | required | unset |
 
 `E2E_USER_PASSWORD` is an Environment **secret**, not a variable, and is the one value the
-caller still passes through `secrets:`.
+caller still passes through `secrets:`. It is staging only, and so is `E2E_USER_EMAIL`:
+production runs read only, so neither is resolved or required there.
 
 The gate variables and `E2E_KMS_KEY_ID` are unset in production because production has no
 access gate and refuses minted tokens. Minting turns on when the resolved `E2E_KMS_KEY_ID` is
@@ -832,12 +845,12 @@ missing variable fails in seconds rather than midway through the suite.
 a value the convention does not cover, passes it with `with:` and that wins. The inputs are
 unchanged, so a caller written against the earlier tag keeps working.
 
-**Branch protection.** Add `e2e (staging)`, or whatever `check-name` resolves to on staging,
-to the required status checks on `main` in the product's ruleset. The staging deploy publishes
-that check on the commit it deployed, and the release pull request from `staging` to `main`
-carries the same commit, so a red staging run blocks promotion. Production runs publish
-`e2e (production)`, which is left off the required list: it reports after the fact, since
-there is nothing left to gate by then.
+**Branch protection.** `e2e (staging)` is the required check for the release pull request into
+`main`. Add it, or whatever `check-name` resolves to on staging, to the required status checks
+on `main` in the product's ruleset. The staging deploy publishes that check on the commit it
+deployed, and the release pull request from `staging` to `main` carries the same commit, so a
+red staging run blocks promotion. The production run is a read-only smoke that reports only:
+it publishes `e2e (production)` after the fact and is never a required check.
 
 ---
 

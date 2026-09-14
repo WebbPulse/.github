@@ -32,6 +32,14 @@ on:
         type: string
         required: false
         default: "main"
+      read-only-environments:
+        description: >-
+          Comma separated environment names that run the suite read only. A read only run is
+          anonymous: the plugin skips every signed in and mutating test, and E2E_USER_EMAIL
+          and E2E_USER_PASSWORD are not required. Empty makes every environment full.
+        type: string
+        required: false
+        default: "production"
       api-base-url:
         description: >-
           Base URL of the deployed API, for example https://api.staging.example.com.
@@ -210,6 +218,7 @@ jobs:
       run: ${{ steps.decide.outputs.run }}
       sha: ${{ steps.decide.outputs.sha }}
       environment: ${{ steps.decide.outputs.environment }}
+      read-only: ${{ steps.decide.outputs.read-only }}
     steps:
       - name: Decide whether this run owns the suite
         id: decide
@@ -226,14 +235,34 @@ jobs:
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
           INPUT_SHA: ${{ inputs.sha }}
           FALLBACK_BRANCH: ${{ github.ref_name }}
+          READ_ONLY_ENVIRONMENTS: ${{ inputs.read-only-environments }}
         run: |
           set -euo pipefail
 
+          read_only_for() {
+            local CANDIDATE NAME
+            NAME="$1"
+            if [ -z "$NAME" ]; then
+              echo false
+              return
+            fi
+            while IFS= read -r CANDIDATE; do
+              if [ "$CANDIDATE" = "$NAME" ]; then
+                echo true
+                return
+              fi
+            done < <(echo "$READ_ONLY_ENVIRONMENTS" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$')
+            echo false
+          }
+
           emit() {
+            local READ_ONLY
+            READ_ONLY=$(read_only_for "$3")
             {
               echo "run=$1"
               echo "sha=$2"
               echo "environment=$3"
+              echo "read-only=$READ_ONLY"
             } >> "$GITHUB_OUTPUT"
           }
 
@@ -357,8 +386,9 @@ jobs:
       E2E_GATE_COOKIE_DOMAIN: ${{ inputs.gate-cookie-domain != '' && inputs.gate-cookie-domain || vars.E2E_GATE_COOKIE_DOMAIN }}
       E2E_BROWSER: ${{ inputs.browser }}
       E2E_HEADLESS: ${{ inputs.headless }}
-      E2E_USER_EMAIL: ${{ inputs.user-email != '' && inputs.user-email || vars.E2E_USER_EMAIL }}
-      E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD != '' && secrets.E2E_USER_PASSWORD || secrets.e2e-user-password }}
+      E2E_READ_ONLY: ${{ needs.gate.outputs.read-only }}
+      E2E_USER_EMAIL: ${{ needs.gate.outputs.read-only != 'true' && (inputs.user-email != '' && inputs.user-email || vars.E2E_USER_EMAIL) || '' }}
+      E2E_USER_PASSWORD: ${{ needs.gate.outputs.read-only != 'true' && (secrets.E2E_USER_PASSWORD != '' && secrets.E2E_USER_PASSWORD || secrets.e2e-user-password) || '' }}
       E2E_MINT_ENABLED: ${{ inputs.mint-enabled || (inputs.kms-key-id != '' && inputs.kms-key-id || vars.E2E_KMS_KEY_ID) != '' }}
       E2E_KMS_KEY_ID: ${{ inputs.kms-key-id != '' && inputs.kms-key-id || vars.E2E_KMS_KEY_ID }}
       E2E_ISSUER: ${{ inputs.issuer != '' && inputs.issuer || vars.E2E_ISSUER }}
@@ -369,13 +399,18 @@ jobs:
       ROLE_TO_ASSUME: ${{ secrets.role-to-assume != '' && secrets.role-to-assume || vars.AWS_DEPLOY_ROLE_ARN }}
       TARGET_SHA: ${{ needs.gate.outputs.sha }}
       CHECK_NAME: ${{ inputs.check-name != '' && inputs.check-name || format('e2e ({0})', needs.gate.outputs.environment) }}
+      MODE: ${{ needs.gate.outputs.read-only == 'true' && 'read-only' || 'full' }}
       JUNIT_PATH: ${{ inputs.working-directory }}/e2e-results.xml
     steps:
       - name: Check every required value resolved
         run: |
           set -euo pipefail
+          REQUIRED="E2E_API_BASE_URL E2E_WEB_BASE_URL ROLE_TO_ASSUME"
+          if [ "$E2E_READ_ONLY" != "true" ]; then
+            REQUIRED="${REQUIRED} E2E_USER_EMAIL E2E_USER_PASSWORD"
+          fi
           MISSING=""
-          for NAME in E2E_API_BASE_URL E2E_WEB_BASE_URL E2E_USER_EMAIL ROLE_TO_ASSUME E2E_USER_PASSWORD; do
+          for NAME in $REQUIRED; do
             if [ -z "${!NAME}" ]; then
               MISSING="${MISSING} ${NAME}"
             fi
@@ -384,7 +419,11 @@ jobs:
             echo "::error::These values resolved empty for the ${E2E_ENVIRONMENT} environment:${MISSING}. Set them as Environment variables on ${E2E_ENVIRONMENT}, or pass them as explicit inputs. E2E_USER_PASSWORD is an Environment secret."
             exit 1
           fi
-          echo "Every required value resolved for ${E2E_ENVIRONMENT}."
+          if [ "$E2E_READ_ONLY" = "true" ]; then
+            echo "Every required value resolved for ${E2E_ENVIRONMENT}, which runs read-only: anonymous, no sign in and no mutations."
+          else
+            echo "Every required value resolved for ${E2E_ENVIRONMENT}."
+          fi
 
       - name: Check out the deployed commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -559,14 +598,19 @@ jobs:
             const xml = readJunit(junitPath);
             const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
             const suiteOutcome = process.env.SUITE_OUTCOME || "skipped";
+            const mode = process.env.MODE === "read-only" ? "read-only" : "full";
             const jobStatus = process.env.JOB_STATUS;
             const conclusion = jobStatus === "success" ? "success" : jobStatus === "cancelled" ? "cancelled" : "failure";
 
             const lines = [];
             lines.push(`[View the workflow run](${runUrl})`);
             lines.push("");
-            lines.push(`Suite: ${suiteOutcome}.`);
+            lines.push(`Suite: ${suiteOutcome}. Mode: ${mode}.`);
             lines.push("");
+            if (mode === "read-only") {
+              lines.push("A read-only run is anonymous: no sign in, no mutations, and every signed-in test is skipped.");
+              lines.push("");
+            }
 
             if (xml === null) {
               lines.push(`No junit report was written to \`${path.basename(junitPath)}\`, so the suite did not reach the reporting stage.`);
@@ -593,7 +637,7 @@ jobs:
               status: "completed",
               conclusion,
               output: {
-                title: `${process.env.CHECK_NAME}: ${conclusion}`,
+                title: `${process.env.CHECK_NAME}: ${conclusion} (${mode})`,
                 summary: summary.slice(0, 65000),
               },
             });
