@@ -715,6 +715,7 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | `python-version` | string | `3.13` | |
 | `pytest-args` | string | `""` | |
 | `browser` | string | `chromium` | Playwright browser the suite drives. |
+| `timeout-minutes` | number | `90` | Minutes the suite job may run before GitHub cancels it, so a hung run never blocks the next one queued in the concurrency group. |
 | `headless` | boolean | `true` | Run the browser headless. |
 | `check-name` | string | `""` | Empty derives `e2e (<environment>)`. |
 | `legacy-route-names` | string | `""` | Comma separated, must not appear in the bundle. Empty reads `vars.E2E_LEGACY_ROUTE_NAMES`. |
