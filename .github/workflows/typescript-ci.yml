@@ -85,6 +85,15 @@ on:
         type: string
         required: false
         default: ""
+      codeartifact-namespace:
+        description: >-
+          Optional npm scope to bind to CodeArtifact, for example @webbpulse. Empty makes
+          CodeArtifact the default registry for every package, so the whole public npm
+          registry is proxied through it and billed as CodeArtifact traffic. Product
+          callers should pass their scope.
+        type: string
+        required: false
+        default: ""
       aws-region:
         description: "AWS region for the CodeArtifact login."
         type: string
@@ -157,12 +166,19 @@ jobs:
           CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
           CODEARTIFACT_DOMAIN_OWNER: ${{ secrets.codeartifact-domain-owner }}
           CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_NAMESPACE: ${{ inputs.codeartifact-namespace }}
         run: |
+          set -euo pipefail
+          NAMESPACE_ARGS=()
+          if [ -n "$CODEARTIFACT_NAMESPACE" ]; then
+            NAMESPACE_ARGS=(--namespace "$CODEARTIFACT_NAMESPACE")
+          fi
           aws codeartifact login \
             --tool npm \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY"
+            --repository "$CODEARTIFACT_REPOSITORY" \
+            "${NAMESPACE_ARGS[@]}"
 
       - name: Install dependencies
         env:
