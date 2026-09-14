@@ -494,6 +494,16 @@ runs `update-function-code --image-uri`, waits again with `function-updated-v2`
 (container image functions stay `Pending` while Lambda optimizes the image), then
 optionally probes a smoke URL with retries.
 
+**Every function updates concurrently.** The per function work runs in the background
+inside the one job, so a fleet takes about as long as its slowest function instead of
+the sum of all of them. Almost all of the roughly ten seconds a function takes is
+Lambda's own image update latency, so a thirteen function map went from about 140
+seconds to about 20. Output stays readable: each function's log is captured to its own
+file and the files are printed as `::group::<function>` blocks in map order once every
+function has finished, so nothing interleaves. A failing function does not abort its
+siblings; the step waits for all of them, prints every group, then fails naming the
+functions that failed.
+
 **Why it waits before updating, and retries.** Terraform owns function configuration
 in this estate, and `image_uri` is under `ignore_changes` in the Lambda module, so a
 deploy only ever moves the digest. But a Terraform apply changing configuration can be
