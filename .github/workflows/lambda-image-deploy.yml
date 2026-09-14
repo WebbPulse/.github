@@ -131,11 +131,12 @@ jobs:
           PUBLISH_VERSION: ${{ inputs.publish-version }}
         run: |
           set -euo pipefail
+          LOG_DIR=$(mktemp -d)
           FUNCTIONS=$(echo "$TARGETS" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)))")
-          while IFS= read -r FUNCTION; do
-            [ -n "$FUNCTION" ] || continue
-            IMAGE=$(echo "$TARGETS" | FN="$FUNCTION" python3 -c "import json,os,sys; print(json.load(sys.stdin)[os.environ['FN']])")
-            echo "::group::$FUNCTION"
+
+          update_one() {
+            FUNCTION=$1
+            IMAGE=$2
             echo "Image: $IMAGE"
 
             aws lambda wait function-updated-v2 --function-name "$FUNCTION"
@@ -166,7 +167,7 @@ jobs:
               if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
                 echo "$OUTPUT"
                 echo "update-function-code failed after $ATTEMPT attempts."
-                exit 1
+                return 1
               fi
 
               case "$OUTPUT" in
@@ -178,15 +179,46 @@ jobs:
                   ;;
                 *)
                   echo "$OUTPUT"
-                  exit 1
+                  return 1
                   ;;
               esac
             done
 
             aws lambda wait function-updated-v2 --function-name "$FUNCTION"
             echo "$FUNCTION is updated and active."
-            echo "::endgroup::"
+          }
+
+          INDEX=0
+          PIDS=()
+          NAMES=()
+          while IFS= read -r FUNCTION; do
+            [ -n "$FUNCTION" ] || continue
+            IMAGE=$(echo "$TARGETS" | FN="$FUNCTION" python3 -c "import json,os,sys; print(json.load(sys.stdin)[os.environ['FN']])")
+            INDEX=$(( INDEX + 1 ))
+            update_one "$FUNCTION" "$IMAGE" > "$LOG_DIR/$INDEX.log" 2>&1 &
+            PIDS+=("$!")
+            NAMES+=("$FUNCTION")
           done <<< "$FUNCTIONS"
+
+          FAILED=()
+          for I in "${!PIDS[@]}"; do
+            if ! wait "${PIDS[$I]}"; then
+              FAILED+=("${NAMES[$I]}")
+            fi
+          done
+
+          for I in "${!NAMES[@]}"; do
+            echo "::group::${NAMES[$I]}"
+            cat "$LOG_DIR/$(( I + 1 )).log"
+            echo "::endgroup::"
+          done
+
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::Failed to update: ${FAILED[*]}"
+            exit 1
+          fi
+
+          echo "All ${#NAMES[@]} function(s) updated and active."
 
       - name: Smoke test
         if: inputs.smoke-url != ''

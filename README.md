@@ -33,8 +33,8 @@ One line each, pointing at the section that documents the inputs, secrets and be
   domain image with buildx, pushes it to ECR through OIDC, and returns the digest pinned
   image URI.
 - [`lambda-image-deploy.yml`](.github/workflows/README.md#lambda-image-deployyml) points
-  one or many Lambda functions at an image URI, waiting for each function to settle
-  either side of the update.
+  one or many Lambda functions at an image URI concurrently, waiting for each function
+  to settle either side of the update.
 - [`spa-deploy.yml`](.github/workflows/README.md#spa-deployyml) builds a frontend, syncs
   it to S3 in three ordered passes so the site is never briefly broken, and invalidates
   CloudFront.
