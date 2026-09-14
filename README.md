@@ -14,10 +14,13 @@ names live here. Every one of those values arrives from the calling repository a
   which lints this repository's own workflow files with actionlint. Each reusable
   workflow is documented in
   [`.github/workflows/README.md`](.github/workflows/README.md).
-- **`actions/`** contains composite actions. Today that is
+- **`actions/`** contains composite actions:
   [`actions/tfc-wait`](actions/tfc-wait/action.yml), which holds until an HCP Terraform
   workspace can no longer change infrastructure under a deploy, for a repository whose
-  deploy is a plain job rather than a call into a reusable workflow.
+  deploy is a plain job rather than a call into a reusable workflow; and
+  [`actions/affected-domains`](actions/affected-domains/action.yml), which works out which
+  backend domains a diff affects so CI shards and deploys run only for the domains whose
+  code changed.
 - **`profile/README.md`** is the organisation profile rendered on the WebbPulse GitHub
   organisation page.
 

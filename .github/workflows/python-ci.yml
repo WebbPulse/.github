@@ -68,6 +68,22 @@ on:
         type: string
         required: false
         default: "{}"
+      domains-filter:
+        description: >-
+          Optional JSON array of domain names. When non-empty the discovered domains are
+          intersected with it, so only the domains a change actually affects get a shard.
+          The literal `[]` means no domain shards at all. Empty, the default, means no
+          filtering, which is the behaviour every existing caller already has.
+        type: string
+        required: false
+        default: ""
+      run-shared:
+        description: >-
+          Whether to run the shared shard carrying everything outside the domain
+          directories. False skips it, for a change that touches no cross-cutting test.
+        type: boolean
+        required: false
+        default: true
       runs-on:
         description: "Runner label."
         type: string
@@ -122,10 +138,13 @@ jobs:
       - id: domains
         name: Discover the test domains
         working-directory: ${{ inputs.working-directory }}
+        env:
+          DOMAINS_FILTER: ${{ inputs.domains-filter }}
         run: |
           set -euo pipefail
           DOMAINS=$(python3 - <<'PY'
           import json
+          import os
           import pathlib
           import sys
           import tomllib
@@ -159,20 +178,45 @@ jobs:
 
           if domains and entrypoints:
               root = pathlib.Path(entrypoints)
-              missing = [
-                  name
-                  for name in domains
-                  if not (root / f"{name.replace('-', '_')}.py").is_file()
-              ]
+              domains_package = pathlib.Path("app/domains")
+
+              def has_entrypoint(name):
+                  """Either layout counts: a flat module, or a package with entrypoint.py."""
+                  module = name.replace("-", "_")
+                  if (root / f"{module}.py").is_file():
+                      return True
+                  return (domains_package / module / "entrypoint.py").is_file()
+
+              missing = [name for name in domains if not has_entrypoint(name)]
               if missing:
                   existing = sorted(p.stem for p in root.glob("*.py")) if root.is_dir() else []
+                  packages = (
+                      sorted(p.name for p in domains_package.iterdir() if (p / "entrypoint.py").is_file())
+                      if domains_package.is_dir()
+                      else []
+                  )
                   print(
-                      "test domain directories with no matching entrypoint module under "
-                      f"{entrypoints}: {', '.join(missing)}. Modules that do exist: "
-                      f"{', '.join(existing) or '(none)'}",
+                      "test domain directories with no matching entrypoint under "
+                      f"{entrypoints}/<name>.py or app/domains/<name>/entrypoint.py: "
+                      f"{', '.join(missing)}. Flat modules that do exist: "
+                      f"{', '.join(existing) or '(none)'}. Domain packages that do exist: "
+                      f"{', '.join(packages) or '(none)'}",
                       file=sys.stderr,
                   )
                   sys.exit(1)
+
+          selected = os.environ.get("DOMAINS_FILTER", "").strip()
+          if selected:
+              try:
+                  wanted = json.loads(selected)
+              except json.JSONDecodeError as error:
+                  print(f"domains-filter is not valid JSON: {error}", file=sys.stderr)
+                  sys.exit(1)
+              if not isinstance(wanted, list):
+                  print("domains-filter must be a JSON array of domain names.", file=sys.stderr)
+                  sys.exit(1)
+              wanted = set(wanted)
+              domains = [name for name in domains if name in wanted]
 
           print(json.dumps(domains))
           PY
@@ -180,7 +224,11 @@ jobs:
           echo "domains=$DOMAINS" >> "$GITHUB_OUTPUT"
           if [ "$DOMAINS" = "[]" ]; then
             echo "has-domains=false" >> "$GITHUB_OUTPUT"
-            echo "No test domain directories found. The shared job will carry the whole suite."
+            if [ -n "${DOMAINS_FILTER:-}" ]; then
+              echo "domains-filter selected no domains, so no domain job runs."
+            else
+              echo "No test domain directories found. The shared job will carry the whole suite."
+            fi
           else
             echo "has-domains=true" >> "$GITHUB_OUTPUT"
             echo "Domains: $DOMAINS"
@@ -535,6 +583,7 @@ jobs:
   shared-tests:
     name: Tests (shared)
     needs: discover
+    if: inputs.run-shared
     runs-on: ${{ inputs.runs-on }}
     permissions:
       contents: read

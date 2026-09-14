@@ -1,0 +1,88 @@
+name: Affected domains
+description: >-
+  Works out which backend domains a diff actually affects, so CI shards and deploys
+  run only for the domains whose code changed. A file under a domain belongs to that
+  domain, a file under app/common belongs to every domain whose entrypoint import
+  closure reaches it, and anything that rebuilds every image yields all of them.
+  A base that cannot be resolved is reported as unknown, which yields all domains.
+
+inputs:
+  working-directory:
+    description: "Directory holding the Python project, relative to the repository root."
+    required: false
+    default: "backend"
+  base:
+    description: >-
+      Commit sha or ref to diff from. Empty means unknown, which yields all domains,
+      as does a base that cannot be resolved or is not an ancestor of head.
+    required: false
+    default: ""
+  head:
+    description: "Commit sha or ref to diff to."
+    required: false
+    default: "HEAD"
+  mode:
+    description: >-
+      `deploy` attributes only files that ship in an image, so a test-only change
+      deploys nothing. `ci` also attributes the test tree and reports the shared shard.
+    required: false
+    default: "ci"
+  extra-full-paths:
+    description: >-
+      Repo-relative glob patterns, one per line, that force every domain. Products pass
+      their deploy workflow path and their Terraform paths here.
+    required: false
+    default: ""
+  unattributed:
+    description: >-
+      What to do with a file under `app/` that no entrypoint reaches and no by-name
+      loader claims. `all` is the safe reading; `none` suits a tree whose reachability
+      test already forbids an unreached file.
+    required: false
+    default: "all"
+
+outputs:
+  domains:
+    description: "JSON array of the affected domain names, in discovery order."
+    value: ${{ steps.affected.outputs.domains }}
+  all:
+    description: >-
+      `true` when every domain is affected, so a caller can ignore the walk and keep
+      whatever behaviour it had before this action existed.
+    value: ${{ steps.affected.outputs.all }}
+  any:
+    description: "`true` when the domains list is non-empty."
+    value: ${{ steps.affected.outputs.any }}
+  shared:
+    description: >-
+      In `ci` mode, `true` when the shared test shard has to run. Always `false` in
+      `deploy` mode.
+    value: ${{ steps.affected.outputs.shared }}
+  reason:
+    description: "One human readable line explaining the verdict."
+    value: ${{ steps.affected.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - id: affected
+      name: Work out the affected domains
+      shell: bash
+      env:
+        AFFECTED_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        AFFECTED_BASE: ${{ inputs.base }}
+        AFFECTED_HEAD: ${{ inputs.head }}
+        AFFECTED_MODE: ${{ inputs.mode }}
+        AFFECTED_EXTRA_FULL_PATHS: ${{ inputs.extra-full-paths }}
+        AFFECTED_UNATTRIBUTED: ${{ inputs.unattributed }}
+        AFFECTED_SCRIPT: ${{ github.action_path }}/affected_domains.py
+      run: |
+        set -euo pipefail
+        python3 "$AFFECTED_SCRIPT" \
+          --repo-root "$GITHUB_WORKSPACE" \
+          --working-directory "$AFFECTED_WORKING_DIRECTORY" \
+          --base "$AFFECTED_BASE" \
+          --head "$AFFECTED_HEAD" \
+          --mode "$AFFECTED_MODE" \
+          --unattributed "$AFFECTED_UNATTRIBUTED" \
+          --extra-full-paths "$AFFECTED_EXTRA_FULL_PATHS"

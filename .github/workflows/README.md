@@ -51,8 +51,8 @@ from the project environment without a `uv run` prefix.
 | `Lint` | `ruff-target` or `lint-commands` non empty | `ruff check`, `ruff format --check`, then each extra command. |
 | `Type check` | `typecheck-command` non empty | |
 | `Security` | `security-commands` non empty | |
-| `Tests (<domain>)` | one per discovered domain | `fail-fast: false`, so a two-domain break needs one run, not two. |
-| `Tests (shared)` | always | Everything outside the domain directories. Whole suite when there are none. |
+| `Tests (<domain>)` | one per discovered domain, after `domains-filter` | `fail-fast: false`, so a two-domain break needs one run, not two. |
+| `Tests (shared)` | `run-shared` is true | Everything outside the domain directories. Whole suite when there are none. |
 | `all-checks-passed` | always | The context to require. See [Merging: auto-merge on green](#merging-auto-merge-on-green). |
 
 ### Domains are directories
@@ -75,13 +75,16 @@ entrypoints = "app/entrypoints"
 | --- | --- | --- |
 | `test-root` | `tests` | Directory the `shared` job sweeps. |
 | `domains-root` | `<test-root>/domains` | Parent of the per-domain test directories. |
-| `entrypoints` | `""` | When set, every domain directory must have a matching module. |
+| `entrypoints` | `""` | When set, every domain directory must have a matching entrypoint. |
 
 Paths are relative to `working-directory`. With `entrypoints` set, a domain directory
-`tests/domains/identity` requires `app/entrypoints/identity.py`; a hyphen in a directory name
-maps to an underscore in the module name. Discovery **fails** naming the directories with no
-module and listing the modules that do exist, so a test directory can never drift away from
-the deployable it covers.
+`tests/domains/identity` requires **either** a flat `app/entrypoints/identity.py` **or** a
+domain package `app/domains/identity/entrypoint.py`; a hyphen in a directory name maps to an
+underscore in the module name. Either layout satisfies the check, so a repository moving to
+the `common` plus `domains` layout keeps the guard instead of deleting the key, and a
+repository part way through the move can hold both. Discovery **fails** naming the directories
+with no entrypoint and listing what does exist in both layouts, so a test directory can never
+drift away from the deployable it covers.
 
 A repository with no `domains-root` directory gets no domain jobs and a `shared` job carrying
 everything, so the workflow can be called unconditionally.
@@ -91,8 +94,8 @@ the directory convention.
 
 ### Adding a domain
 
-1. Create `tests/domains/<name>/` with the domain's tests, and `app/entrypoints/<name>.py`
-   if `entrypoints` is set.
+1. Create `tests/domains/<name>/` with the domain's tests, and the matching entrypoint
+   (`app/entrypoints/<name>.py` or `app/domains/<name>/entrypoint.py`) if `entrypoints` is set.
 2. Open the pull request. `Discover domains` picks it up and a `Tests (<name>)` job appears.
 
 No workflow edit and **no ruleset edit**: the required context is `all-checks-passed`, which
@@ -101,6 +104,50 @@ does not change when the matrix does.
 Add `pytest-xdist` to the project's dev dependency group. The `pytest-workers` input defaults
 to `auto`, and without the plugin the workflow drops `-n` and logs a warning rather than
 running the domains in parallel.
+
+### Running only the domains a change touched
+
+`domains-filter` and `run-shared` narrow the matrix without changing what a domain is.
+Discovery still walks the test tree and still enforces the `entrypoints` guard against
+**every** domain, so a filtered run cannot hide a test directory that has drifted away from
+its deployable. The filter is applied last, intersecting the discovered domains with the
+array, so a name in the filter that is not a domain is ignored rather than conjuring a shard.
+
+Pair it with [`actions/affected-domains`](#actionsaffected-domains), which works out the list:
+
+```yaml
+jobs:
+  affected:
+    runs-on: ubuntu-latest
+    outputs:
+      domains: ${{ steps.affected.outputs.domains }}
+      shared: ${{ steps.affected.outputs.shared }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: affected
+        uses: WebbPulse/.github/actions/affected-domains@v3
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          mode: ci
+
+  backend-ci:
+    needs: affected
+    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v3
+    with:
+      domains-filter: ${{ needs.affected.outputs.domains }}
+      run-shared: ${{ needs.affected.outputs.shared == 'true' }}
+```
+
+Omitting both inputs keeps the previous behaviour exactly: every discovered domain gets a
+shard and the `shared` shard always runs. Lint, type check and security are untouched by
+either input, because they read the whole tree regardless of which domain moved.
+
+`all-checks-passed` stays the required context. A skipped shard counts as a pass there, so a
+filtered run still reports the one context a branch ruleset waits on, and no ruleset edit is
+needed to adopt this.
 
 ### Inputs
 
@@ -117,6 +164,8 @@ running the domains in parallel.
 | `pytest-workers` | string | `auto` | Value for xdist `-n`. Empty omits `-n` for a suite that is not xdist safe. |
 | `coverage-source` | string | `app` | Package measured by coverage. |
 | `test-env-json` | string | `{}` | Env vars exported before pytest. Not for secrets: inputs appear in the log. |
+| `domains-filter` | string | `""` | JSON array intersected with the discovered domains. `[]` means no domain shards. Empty means no filtering. |
+| `run-shared` | boolean | `true` | False skips the `shared` shard. |
 | `runs-on` | string | `ubuntu-latest` | Runner label. |
 | `codeartifact-domain` | string | `""` | Non empty enables the CodeArtifact auth step. |
 | `codeartifact-index` | string | `codeartifact` | Name of the `[[tool.uv.index]]` entry the token authenticates. |
@@ -1176,6 +1225,105 @@ exactly, so a single package caller changes nothing.
 Before these inputs existed the only workaround was to fold the root install into
 `build-command`. That still left the setup-node cache step failing on the missing
 lockfile, so it never actually got as far as building.
+
+---
+
+## `actions/affected-domains`
+
+A composite action that works out which backend domains a diff actually affects, so CI
+shards and deploys run only for the domains whose code changed. It reads the tree it is
+run against, so there is no list to maintain and nothing estate specific in it.
+
+A **domain** is an immediate subdirectory of `<working-directory>/app/domains/` that
+contains an `entrypoint.py`, which is the same thing the image build means by `DOMAIN`.
+
+```yaml
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: affected
+        uses: WebbPulse/.github/actions/affected-domains@v3
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          mode: deploy
+          extra-full-paths: |
+            terraform/**
+            .github/workflows/deploy.yml
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `working-directory` | `backend` | Directory holding the Python project. |
+| `base` | `""` | Commit sha or ref to diff from. Empty, unresolvable, or not an ancestor of `head` means **unknown**, which yields every domain. |
+| `head` | `HEAD` | Commit sha or ref to diff to. |
+| `mode` | `ci` | `deploy` attributes only what ships in an image. `ci` also attributes the test tree and reports `shared`. |
+| `extra-full-paths` | `""` | Repo-relative globs, one per line, that force every domain. |
+| `unattributed` | `all` | What an `app/` file no entrypoint reaches yields. `none` suits a tree whose reachability test already forbids one. |
+
+| Output | Notes |
+| --- | --- |
+| `domains` | JSON array of affected domain names, ready to pass to `domains-filter`. |
+| `all` | `true` when every domain is affected, so a caller can keep its previous behaviour. |
+| `any` | `true` when `domains` is non-empty. |
+| `shared` | `ci` mode only: whether the shared test shard has to run. Always `false` in `deploy` mode. |
+| `reason` | One human readable line, also written to the step summary. |
+
+### How a path is attributed
+
+| Changed path | Affects |
+| --- | --- |
+| Anything matching `extra-full-paths` | every domain |
+| `<wd>/` outside `app/`, `tests/`, `e2e/`, `scripts/`, `docs/` and `README*` | every domain, since the Dockerfile, `pyproject.toml`, `uv.lock` and runtime files rebuild every image |
+| `<wd>/app/domains/<name>/**` | that domain |
+| `<wd>/app/common/**.py` | every domain whose entrypoint closure reaches the file |
+| `<wd>/app/common/**` non Python | every domain, because the walk cannot follow a data file |
+| Other `<wd>/app/**`, for example `app/main.py` | per `unattributed` |
+| `<wd>/tests/domains/<name>/**` | that domain in `ci` mode, nothing in `deploy` mode |
+| Other `<wd>/tests/**`, `<wd>/e2e/**`, `<wd>/scripts/**`, docs | `shared` only in `ci` mode, nothing in `deploy` mode |
+| Anything outside `<wd>/` and not in `extra-full-paths` | nothing |
+
+The action writes a changed path to domains table to `$GITHUB_STEP_SUMMARY`, so a run
+records why each domain was or was not built.
+
+### The import walk
+
+The closure is computed **statically**, by parsing rather than importing, so it holds for
+the image that ships without needing an environment. It follows module level imports and
+function body imports transitively, skips `TYPE_CHECKING` blocks because they never run,
+and attributes a lazy `app.domains.<name>` import made from outside any domain to `<name>`
+alone. That last rule is the per-domain router loader, and it is the property that lets one
+`app/` tree ship as several single-domain images.
+
+The walk is the same one the product repositories assert in their own reachability test, so
+a domain that starts reaching another domain fails that test rather than silently widening a
+deploy here.
+
+### Modules loaded by name
+
+A module reached only through `importlib.import_module` is invisible to a static walk. A
+repository with a registry like that declares it in `<working-directory>/pyproject.toml`:
+
+```toml
+[tool.webbpulse.reachability]
+anchor = "app.common.db.dynamo.registry"
+loaded-by-name = ["app.common.db.dynamo.*"]
+```
+
+| Key | Meaning |
+| --- | --- |
+| `loaded-by-name` | Dotted **module globs**, matched against the module name each file provides. |
+| `anchor` | The module doing the by-name loading. A matched file is attributed to every domain whose closure reaches this module. |
+
+`anchor` is what keeps the registry honest: a repository where only some domains touch the
+registry gets only those domains, rather than every domain on every repository file. Omit it
+and the globs fall back to **all** domains, which is the safe reading rather than the useful
+one. The table is optional; without it a by-name module is simply unreached and takes the
+`unattributed` policy.
+
+Globs are `fnmatch` patterns over dotted module names, so `app.common.db.dynamo.*` matches
+`app.common.db.dynamo.users` and also `app.common.db.dynamo.registry` itself.
 
 ---
 
