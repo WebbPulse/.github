@@ -244,7 +244,8 @@ jobs:
 ## `container-image.yml`
 
 Builds one domain image with buildx for a single platform, logs in to ECR through
-OIDC, pushes the immutable tag `sha-<full git sha>`, and returns the digest and the
+OIDC, pushes the immutable tag `sha-<full git sha>` (or
+`sha-<full git sha>-<image-tag-suffix>`), and returns the digest and the
 digest pinned image URI so a deploy job can pin the exact artifact. Optionally mints
 a CodeArtifact token for the build, logs in to a second account's registry so a
 cross account base image can be pulled, skips a build whose tag already exists, and
@@ -295,7 +296,7 @@ registry, so the workflow resolves the caller's own registry host from
 target is unchanged either way: the caller's own account.
 
 **Why the existing tag guard.** ECR repositories in this estate are created with
-`IMMUTABLE` tags and the only tag is `sha-<full git sha>`, so re-running a green
+`IMMUTABLE` tags and the default tag is `sha-<full git sha>`, so re-running a green
 commit pushes a tag that already exists. If the rebuild is byte identical ECR treats
 the re-tag as a no-op and it succeeds; if anything moved, `PutImage` fails with
 `ImageTagAlreadyExistsException` for a reason unrelated to the commit under test.
@@ -307,6 +308,17 @@ The check uses `aws ecr batch-get-image`, not `describe-images`. A consumer depl
 role typically holds `ecr:BatchGetImage` on its own domain repositories but
 `ecr:DescribeImages` only on the shared base image repository, so `describe-images`
 would be denied on exactly the repositories this needs to read.
+
+**Why `image-tag-suffix` exists.** The skip is keyed on the tag, and the tag is keyed
+on the commit alone, so a rebuild that is meant to change the image without changing
+the commit is skipped and the old digest is redeployed. A dependency refresh is the
+case that matters: a caller stamps a build argument so the layer that resolves the
+newest package rebuilds, but on an already built commit the tag is unchanged and no
+build runs at all. Passing a suffix gives that run its own immutable tag, so the
+build happens and a new digest is pushed. Left empty the tag and the skip behave
+exactly as before. The suffix is validated against `[A-Za-z0-9_.-]+` and the whole
+tag against the 128 character ECR limit, so an unusable tag fails at the first step
+rather than at `PutImage`.
 
 **Why the base image is served from the Actions cache.** The layer cache
 (`cache-from`/`cache-to: type=gha`) caches the layers the build produces, not the
@@ -365,6 +377,7 @@ a single directory, and assembles the `function-image-map` that
 | `codeartifact-repository` | string | `""` | Required when `codeartifact-domain` is set. |
 | `codeartifact-secret-id` | string | `codeartifact_token` | BuildKit secret id the Dockerfile mounts. |
 | `additional-ecr-registries` | string | `""` | Comma or newline separated account ids. The caller's own is always included. |
+| `image-tag-suffix` | string | `""` | Appended to the tag as `sha-<full git sha>-<suffix>`. Empty keeps the plain `sha-<full git sha>`. Must match `[A-Za-z0-9_.-]+`. |
 | `skip-if-tag-exists` | boolean | `true` | Skip the build when the tag already resolves, and emit the existing digest. |
 | `upload-manifest-artifact` | boolean | `false` | Upload the per leg JSON manifest. |
 | `artifact-name` | string | `""` | Overrides the default `image-<sanitised repository>-<tag>`. |
@@ -379,7 +392,7 @@ a single directory, and assembles the `function-image-map` that
 | --- | --- |
 | `image-digest` | `sha256:...`, whether built or already present. |
 | `image-uri` | `registry/repository@sha256:...` |
-| `image-tag` | `sha-<full git sha>` |
+| `image-tag` | `sha-<full git sha>`, with `-<image-tag-suffix>` appended when that input is set. |
 | `image-existed` | `true` when the tag already resolved and the build was skipped. |
 
 Single image, no CodeArtifact, no cross account base:
