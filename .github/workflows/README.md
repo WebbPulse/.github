@@ -785,6 +785,13 @@ can never hold a permission its caller did not.
 `cancel-in-progress: false` is deliberate. A staging and a production run can be in flight at
 once, and cancelling the earlier one would leave its check run unpublished.
 
+Two GitHub rules shape the caller. A `workflow_run` or `workflow_dispatch` workflow only exists
+once its file is on the default branch, so a caller merged to `staging` alone never fires; land
+the identical file on `main` first. And a `workflow_run` run always executes on the default
+branch, so the `staging` GitHub Environment's deployment branch policy must allow `main` as well
+as `staging`, otherwise the e2e job is rejected before its first step with "Branch main is not
+allowed to deploy to staging".
+
 ### The gate
 
 The first job decides whether this run owns the suite, which commit it verifies, and which
