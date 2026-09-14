@@ -308,6 +308,30 @@ role typically holds `ecr:BatchGetImage` on its own domain repositories but
 `ecr:DescribeImages` only on the shared base image repository, so `describe-images`
 would be denied on exactly the repositories this needs to read.
 
+**Why the base image is served from the Actions cache.** The layer cache
+(`cache-from`/`cache-to: type=gha`) caches the layers the build produces, not the
+layers it pulls. BuildKit still fetches every `FROM` layer from the registry to
+export the final image, so a cross account base image was downloaded from ECR on
+every build of every domain, billed as ECR data transfer out.
+
+Before the build, the workflow reads the `ARG BASE_IMAGE=` default out of the
+Dockerfile it is about to build, keys an `actions/cache` entry on that reference
+plus the platform, and keeps a single platform OCI layout of the base image there.
+On a miss it copies the image out of ECR with `skopeo`, which is preinstalled on
+`ubuntu-latest` and reuses the `amazon-ecr-login` credentials already in the Docker
+config. It then passes `build-contexts: <reference>=oci-layout://<dir>@<manifest
+digest>` to `docker/build-push-action`, so BuildKit resolves the `FROM` out of the
+local layout. ECR is read once per base digest per repository rather than on every
+build.
+
+The `ARG BASE_IMAGE=` line stays the single source of truth, so Dependabot's docker
+ecosystem updates continue to drive the base image and no caller repository changes.
+The cache path is skipped, and the build behaves exactly as before, when the
+Dockerfile has no `ARG BASE_IMAGE=` default, when that default is not pinned by
+digest, when `platform` names more than one platform, or when the copy produced no
+single platform manifest. The `additional-ecr-registries` login therefore still
+matters: it is what makes the cache miss path work.
+
 **Why the manifest artifact.** A matrix of reusable workflow calls collapses to one
 `needs` entry in the caller whose `outputs` hold whichever leg finished last, and a
 job with `uses:` cannot carry `steps:` to capture them itself. With
