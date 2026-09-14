@@ -222,7 +222,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/typescript-ci.yml@v2
+    uses: WebbPulse/.github/.github/workflows/typescript-ci.yml@v3
     with:
       working-directory: frontend
       node-version: "22"
@@ -356,7 +356,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/container-image.yml@v2
+    uses: WebbPulse/.github/.github/workflows/container-image.yml@v3
     with:
       ecr-repository: ${{ vars.ECR_REPOSITORY }}
       aws-region: ${{ vars.AWS_REGION }}
@@ -396,7 +396,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/container-image.yml@v2
+    uses: WebbPulse/.github/.github/workflows/container-image.yml@v3
     with:
       environment: ${{ needs.resolve-env.outputs.name }}
       ecr-repository: webbpulse-${{ needs.resolve-env.outputs.name }}/${{ matrix.domain }}
@@ -502,7 +502,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v2
+    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v3
     with:
       aws-region: ${{ vars.AWS_REGION }}
       environment: production
@@ -618,7 +618,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/spa-deploy.yml@v2
+    uses: WebbPulse/.github/.github/workflows/spa-deploy.yml@v3
     with:
       environment: production
       s3-bucket: ${{ vars.FRONTEND_S3_BUCKET }}
@@ -935,7 +935,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-npm.yml@v2
+    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-npm.yml@v3
     with:
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
       codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
@@ -998,11 +998,10 @@ lockfile, so it never actually got as far as building.
 
 A composite action holding the same HCP Terraform wait `spa-deploy.yml` runs inline, for
 a repository whose deploy is a plain job rather than a call into a reusable workflow.
-`CarModPicker`'s `backend-deploy.yml` and `frontend-deploy.yml` both use it.
 
 ```yaml
       - name: Wait for HCP Terraform
-        uses: WebbPulse/.github/actions/tfc-wait@v2
+        uses: WebbPulse/.github/actions/tfc-wait@v3
         with:
           workspace-id: ${{ vars.TFC_WORKSPACE_ID }}
           api-token: ${{ secrets.TFC_API_TOKEN }}
@@ -1055,7 +1054,7 @@ jobs:
   terraform-checks:
     permissions:
       contents: read
-    uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@v2
+    uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@v3
     with:
       working-directory: terraform
     secrets:
@@ -1161,17 +1160,17 @@ production through the callers.
 The release approach is a moving major tag:
 
 - Every change lands on `main` behind a pull request.
-- A release is cut as an immutable `vMAJOR.MINOR.PATCH` tag, for example `v1.4.0`.
-- The `v1` major tag is then **moved** to that commit. Callers pin `@v1` and pick up
+- A release is cut as an immutable `vMAJOR.MINOR.PATCH` tag, for example `v3.4.0`.
+- The `v3` major tag is then **moved** to that commit. Callers pin `@v3` and pick up
   backward compatible fixes without editing anything.
-- A breaking change to any input, secret or output means a new major tag (`v2`), and
-  `v1` stops moving. Callers migrate deliberately.
+- A breaking change to any input, secret or output means a new major tag (`v4`), and
+  `v3` stops moving. Callers migrate deliberately.
 
 ```bash
-git tag -a v1.4.0 -m "Describe the change"
-git push origin v1.4.0
-git tag -f v1          # move the major tag
-git push -f origin v1
+git tag -a v3.4.0 -m "Describe the change"
+git push origin v3.4.0
+git tag -f v3          # move the major tag
+git push -f origin v3
 ```
 
 A caller that wants no moving target at all pins the SHA instead, with the tag in a
@@ -1181,8 +1180,10 @@ comment, exactly as this repository pins third party actions:
 uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v3.0.0
 ```
 
-Both forms are fine. `@v3` is the current default for the Python workflows and `@v2` for the rest; pin a SHA where a repository needs a
-change to this repository to be an explicit, reviewed event.
+Both forms are fine. `v3` is the moving major for every workflow in this repository and
+for the composite action, so `@v3` is what a caller pins. `v2` and `v1` are frozen and no
+longer move. Pin a SHA where a repository needs a change to this repository to be an
+explicit, reviewed event.
 
 ### v2 to v3 (Python workflows)
 
