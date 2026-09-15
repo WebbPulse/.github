@@ -112,41 +112,12 @@ on:
         type: string
         required: false
         default: "@webbpulse"
-      tfc-organization:
-        description: >-
-          HCP Terraform organization owning the workspace to wait on. Required when
-          tfc-workspace is set.
-        type: string
-        required: false
-        default: ""
-      tfc-workspace:
-        description: >-
-          HCP Terraform workspace whose runs this deploy waits for. Empty skips the
-          wait, and so does an unset tfc-api-token secret.
-        type: string
-        required: false
-        default: ""
-      tfc-wait-attempts:
-        description: "How many times to poll the workspace before giving up."
-        type: number
-        required: false
-        default: 40
-      tfc-wait-interval-seconds:
-        description: "Seconds between polls of the workspace."
-        type: number
-        required: false
-        default: 15
     secrets:
       role-to-assume:
         description: "IAM role ARN assumed via OIDC, allowed to write the bucket and invalidate the distribution."
         required: true
       codeartifact-domain-owner:
         description: "AWS account id that owns the CodeArtifact domain. Required when codeartifact-domain is set."
-        required: false
-      tfc-api-token:
-        description: >-
-          HCP Terraform API token used to read the workspace runs. Unset skips the
-          wait, so a caller can adopt the wait one repository at a time.
         required: false
 
 permissions:
@@ -164,8 +135,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    env:
-      TFC_WAIT_ENABLED: ${{ inputs.tfc-workspace != '' && secrets.tfc-api-token != '' }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -271,105 +240,6 @@ jobs:
         with:
           role-to-assume: ${{ secrets.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
-
-      - name: Wait for the HCP Terraform workspace to go idle
-        if: env.TFC_WAIT_ENABLED == 'true'
-        env:
-          TFC_WORKSPACE_ID: ""
-          TFC_ORGANIZATION: ${{ inputs.tfc-organization }}
-          TFC_WORKSPACE: ${{ inputs.tfc-workspace }}
-          TFC_API_TOKEN: ${{ secrets.tfc-api-token }}
-          TFC_WAIT_ATTEMPTS: ${{ inputs.tfc-wait-attempts }}
-          TFC_WAIT_INTERVAL_SECONDS: ${{ inputs.tfc-wait-interval-seconds }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$TFC_API_TOKEN" ]; then
-            echo "api-token is empty, so the workspace runs cannot be read."
-            exit 1
-          fi
-
-          api() {
-            curl -sfg \
-              -H "Authorization: Bearer $TFC_API_TOKEN" \
-              -H "Content-Type: application/vnd.api+json" \
-              "$1"
-          }
-
-          if [ -z "$TFC_WORKSPACE_ID" ]; then
-            if [ -z "$TFC_ORGANIZATION" ] || [ -z "$TFC_WORKSPACE" ]; then
-              echo "workspace-id is empty, so organization and workspace are both required."
-              exit 1
-            fi
-            TFC_WORKSPACE_ID=$(api "https://app.terraform.io/api/v2/organizations/${TFC_ORGANIZATION}/workspaces/${TFC_WORKSPACE}" \
-              | python3 -c "import json, sys; print(json.load(sys.stdin)['data']['id'])")
-            echo "Resolved workspace ${TFC_WORKSPACE} to ${TFC_WORKSPACE_ID}."
-          fi
-
-          SETTLED="applied planned_and_finished discarded errored canceled force_canceled"
-
-          for ATTEMPT in $(seq 1 "$TFC_WAIT_ATTEMPTS"); do
-            FIELDS=$(api "https://app.terraform.io/api/v2/workspaces/${TFC_WORKSPACE_ID}/runs?page%5Bsize%5D=1" \
-              | python3 -c "
-          import json
-          import sys
-
-          runs = json.load(sys.stdin).get('data', [])
-          if not runs:
-              print('none no_runs false false')
-              raise SystemExit(0)
-
-          attributes = runs[0]['attributes']
-          actions = attributes.get('actions') or {}
-          print(
-              runs[0]['id'],
-              attributes['status'],
-              str(bool(attributes.get('has-changes'))).lower(),
-              str(bool(actions.get('is-confirmable'))).lower(),
-          )
-          ")
-            read -r RUN_ID STATUS HAS_CHANGES CONFIRMABLE <<< "$FIELDS"
-            echo "Attempt ${ATTEMPT}/${TFC_WAIT_ATTEMPTS}: latest run status is ${STATUS}."
-
-            if [ "$STATUS" = "no_runs" ] || printf '%s' "$SETTLED" | grep -qw "$STATUS"; then
-              echo "Terraform is idle, so the deploy can proceed."
-              exit 0
-            fi
-
-            if [ "$CONFIRMABLE" = "true" ]; then
-              RUN_URL="https://app.terraform.io/app/${TFC_ORGANIZATION:-_}/workspaces/${TFC_WORKSPACE:-$TFC_WORKSPACE_ID}/runs/${RUN_ID}"
-              if [ "$HAS_CHANGES" = "false" ]; then
-                echo "Run ${RUN_ID} is parked in ${STATUS} awaiting confirmation but plans no resource changes,"
-                echo "so it cannot move anything under this deploy. Proceeding."
-                echo "Run: ${RUN_URL}"
-                {
-                  echo "## HCP Terraform"
-                  echo
-                  echo "Run \`${RUN_ID}\` is awaiting confirmation with no resource changes, so the deploy did not wait."
-                  echo
-                  echo "[${RUN_ID}](${RUN_URL})"
-                } >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-              echo "Run ${RUN_ID} is parked in ${STATUS} awaiting confirmation and plans resource changes."
-              echo "Waiting would time out, so this deploy stops now. Apply or discard the run, then rerun."
-              echo "Run: ${RUN_URL}"
-              {
-                echo "## HCP Terraform"
-                echo
-                echo "Run \`${RUN_ID}\` is awaiting confirmation and plans resource changes, so the deploy stopped"
-                echo "rather than deploying against infrastructure that is about to move."
-                echo
-                echo "Apply or discard it, then rerun this workflow: [${RUN_ID}](${RUN_URL})"
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-
-            sleep "$TFC_WAIT_INTERVAL_SECONDS"
-          done
-
-          echo "Timed out waiting for the workspace to go idle."
-          exit 1
 
       - name: Sync the hashed assets
         working-directory: ${{ inputs.working-directory }}
