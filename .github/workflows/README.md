@@ -257,7 +257,7 @@ a branch ruleset requires. See [Merging: auto-merge on green](#merging-auto-merg
 | `build-env-json` | string | `{}` | JSON object of build variables, for example `VITE_` values. |
 | `runs-on` | string | `ubuntu-latest` | |
 | `codeartifact-domain` / `codeartifact-repository` / `aws-region` | string | `""` | Same gating as `python-ci.yml`. |
-| `codeartifact-namespace` | string | `""` | npm scope to bind, for example `@webbpulse`. Empty makes CodeArtifact the default registry for every package. See [Scope the npm login](#scope-the-npm-login). |
+| `codeartifact-namespace` | string | `"@webbpulse"` | npm scope to bind. Must start with `@`; the workflow fails when `codeartifact-domain` is set and this is empty or unscoped. See [Scope the npm login](#scope-the-npm-login). |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
@@ -268,10 +268,14 @@ a branch ruleset requires. See [Merging: auto-merge on green](#merging-auto-merg
 
 `aws codeartifact login --tool npm` without `--namespace` rewrites the runner's default
 npm registry, so every `npm ci` pulls the entire public registry through CodeArtifact and
-bills it as CodeArtifact data transfer and requests. Pass `codeartifact-namespace` so only
-that scope resolves from CodeArtifact and everything else goes straight to npmjs.org. Every
-caller that sets `codeartifact-domain` should set it; `@webbpulse` is the scope for the
-shared packages. The same input exists on `spa-deploy.yml` and means the same thing.
+bills it as CodeArtifact data transfer and requests. `codeartifact-namespace` binds a single
+scope instead, so only that scope resolves from CodeArtifact and everything else goes
+straight to npmjs.org.
+
+It defaults to `@webbpulse`, the scope for the shared packages, and the workflow fails
+before the login when `codeartifact-domain` is set and the namespace is empty or does not
+start with `@`. A caller with a different scope passes it; no caller can turn the binding
+off. The same input and the same rule exist on `spa-deploy.yml` and `e2e-local.yml`.
 
 Outputs: none.
 
@@ -705,7 +709,7 @@ and the role is assumed after the build, exactly as before.
 | `runs-on` | string | `ubuntu-latest` | |
 | `codeartifact-domain` | string | `""` | Non empty enables the npm login before the install. |
 | `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`, validated at run time. |
-| `codeartifact-namespace` | string | `""` | npm scope to bind, for example `@webbpulse`. Empty makes CodeArtifact the default registry for every package. See [Scope the npm login](#scope-the-npm-login). |
+| `codeartifact-namespace` | string | `"@webbpulse"` | npm scope to bind. Must start with `@`; the workflow fails when `codeartifact-domain` is set and this is empty or unscoped. See [Scope the npm login](#scope-the-npm-login). |
 | `tfc-organization` | string | `""` | Required with `tfc-workspace`, validated at run time. |
 | `tfc-workspace` | string | `""` | Empty skips the wait. |
 | `tfc-wait-attempts` | number | `40` | Polls before the job gives up. |
@@ -1032,7 +1036,7 @@ commit nobody is looking at.
 | `codeartifact-domain` | string | `""` | Empty skips both CodeArtifact auth steps. |
 | `codeartifact-index` | string | `codeartifact` | The `[[tool.uv.index]]` entry the token authenticates. |
 | `codeartifact-repository` | string | `""` | Empty skips the npm login. Required to resolve `@webbpulse/*`. |
-| `codeartifact-namespace` | string | `""` | npm scope to bind. Empty proxies all of public npm through CodeArtifact. |
+| `codeartifact-namespace` | string | `"@webbpulse"` | npm scope to bind. Must start with `@`; the workflow fails when the npm login runs and this is empty or unscoped. See [Scope the npm login](#scope-the-npm-login). |
 | `aws-region` | string | `us-west-2` | For the CodeArtifact token. The stack calls no AWS API. |
 | `node-version` | string | `22` | |
 | `frontend-directory` | string | `frontend` | Holds `package.json` and `package-lock.json`. |

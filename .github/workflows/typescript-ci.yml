@@ -87,13 +87,12 @@ on:
         default: ""
       codeartifact-namespace:
         description: >-
-          Optional npm scope to bind to CodeArtifact, for example @webbpulse. Empty makes
-          CodeArtifact the default registry for every package, so the whole public npm
-          registry is proxied through it and billed as CodeArtifact traffic. Product
-          callers should pass their scope.
+          npm scope bound to CodeArtifact, for example @webbpulse. Must start with @.
+          Binding a scope keeps the public registry as the default, so only that scope
+          resolves through CodeArtifact and the rest of npm is not proxied and billed.
         type: string
         required: false
-        default: ""
+        default: "@webbpulse"
       aws-region:
         description: "AWS region for the CodeArtifact login."
         type: string
@@ -143,6 +142,7 @@ jobs:
         env:
           CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
           AWS_REGION_INPUT: ${{ inputs.aws-region }}
+          CODEARTIFACT_NAMESPACE: ${{ inputs.codeartifact-namespace }}
         run: |
           set -euo pipefail
           MISSING=""
@@ -152,6 +152,17 @@ jobs:
             echo "codeartifact-domain is set, so these inputs are required too:$MISSING"
             exit 1
           fi
+          if [ -z "$CODEARTIFACT_NAMESPACE" ]; then
+            echo "::error::codeartifact-namespace is empty. Pass the npm scope to bind, for example @webbpulse. Without it the npm login rewrites the default registry and proxies the whole public npm registry through CodeArtifact."
+            exit 1
+          fi
+          case "$CODEARTIFACT_NAMESPACE" in
+            @*) ;;
+            *)
+              echo "::error::codeartifact-namespace must start with @, got $CODEARTIFACT_NAMESPACE."
+              exit 1
+              ;;
+          esac
 
       - name: Configure AWS credentials for CodeArtifact
         if: inputs.codeartifact-domain != ''
@@ -169,16 +180,12 @@ jobs:
           CODEARTIFACT_NAMESPACE: ${{ inputs.codeartifact-namespace }}
         run: |
           set -euo pipefail
-          NAMESPACE_ARGS=()
-          if [ -n "$CODEARTIFACT_NAMESPACE" ]; then
-            NAMESPACE_ARGS=(--namespace "$CODEARTIFACT_NAMESPACE")
-          fi
           aws codeartifact login \
             --tool npm \
             --domain "$CODEARTIFACT_DOMAIN" \
             --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
             --repository "$CODEARTIFACT_REPOSITORY" \
-            "${NAMESPACE_ARGS[@]}"
+            --namespace "$CODEARTIFACT_NAMESPACE"
 
       - name: Install dependencies
         env:
