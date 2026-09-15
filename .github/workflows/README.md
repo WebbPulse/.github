@@ -612,9 +612,14 @@ change: one job block plus one `needs` entry.
 | `base-image` | The digest pinned reference read out of the Dockerfile. |
 | `enabled` | `true` when the cache applies to this Dockerfile and platform. |
 
-The job needs `id-token: write` from the caller. It is deliberately not a gate: the
-matrix legs still restore and still fall back to `skopeo` on a miss, so a failed or
-skipped warm up costs a pull rather than a deploy.
+The job needs `id-token: write` from the caller.
+
+Because the build matrix reaches it through `needs`, a failed warm up does stop the
+deploy rather than degrading it. That is the price of keeping the caller change to one
+job block plus one `needs` entry. The correctness of the build does not depend on it:
+the matrix legs still restore the key themselves and still fall back to `skopeo` on a
+miss, so a caller that would rather trade the pull for the resilience can add
+`always() &&` to its build job's `if` and let the warm up fail open.
 
 ---
 
