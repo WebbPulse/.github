@@ -393,6 +393,12 @@ digest, when `platform` names more than one platform, or when the copy produced 
 single platform manifest. The `additional-ecr-registries` login therefore still
 matters: it is what makes the cache miss path work.
 
+The restore, copy and save live in [`actions/base-image-cache`](#actionsbase-image-cache)
+so the same logic serves both this workflow and the
+[`base-image-cache.yml`](#base-image-cacheyml) warm up job. A caller with no warm up
+job keeps working unchanged: every matrix leg still restores, and still falls back to
+`skopeo` on a miss.
+
 **Why the manifest artifact.** A matrix of reusable workflow calls collapses to one
 `needs` entry in the caller whose `outputs` hold whichever leg finished last, and a
 job with `uses:` cannot carry `steps:` to capture them itself. With
@@ -546,6 +552,69 @@ jobs:
           )
           echo "function-image-map=${MAP}" >> "$GITHUB_OUTPUT"
 ```
+
+---
+
+## `base-image-cache.yml`
+
+Runs [`actions/base-image-cache`](#actionsbase-image-cache) once, on a single job, so a
+caller can warm the key before its build matrix fans out. Call it before
+`container-image.yml` and every matrix leg then restores instead of pulling.
+
+**The two problems it fixes.** The cache key is derived from the base image reference
+plus the platform, so the first run after the base image moves has every matrix leg
+miss at the same time and pull the same image concurrently, once per leg. And GitHub
+lets a branch read the default branch's caches but never the reverse, so a key written
+only on `staging` is never readable on `main`: without a warm up, every production
+deploy misses on every leg, forever. One job writing the key ahead of the fan out
+fixes both, and on `main` it writes the key where the matrix can read it.
+
+```yaml
+  warm-base-image:
+    name: Warm the base image cache
+    needs: [resolve-env, affected]
+    if: needs.affected.outputs.any == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/base-image-cache.yml@v3
+    with:
+      environment: ${{ needs.resolve-env.outputs.name }}
+      aws-region: us-west-2
+      dockerfile: backend/Dockerfile
+      platform: linux/arm64
+      additional-ecr-registries: "432410731887"
+    secrets:
+      role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
+```
+
+The build matrix then adds `warm-base-image` to its `needs`. That is the whole caller
+change: one job block plus one `needs` entry.
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `aws-region` | required | Region holding the ECR registries. |
+| `dockerfile` | `Dockerfile` | Path to the Dockerfile the matrix builds. Pass the same value the matrix passes. |
+| `working-directory` | `""` | Directory the dockerfile path resolves against. Empty means the workspace root. |
+| `platform` | `linux/arm64` | Must match what the matrix passes, since the key covers the platform. |
+| `additional-ecr-registries` | `""` | Further registry account ids to log in to. The caller's own account is always included. |
+| `environment` | `""` | GitHub Environment to bind the job to. |
+| `runs-on` | `ubuntu-latest` | Runner label. |
+
+| Secret | Notes |
+| --- | --- |
+| `role-to-assume` | IAM role ARN assumed via OIDC, needing only read access to the base image repository. |
+
+| Output | Notes |
+| --- | --- |
+| `cache-key` | The key the build matrix will restore. |
+| `cache-hit` | `true` when the layout was already cached, so nothing was pulled. |
+| `base-image` | The digest pinned reference read out of the Dockerfile. |
+| `enabled` | `true` when the cache applies to this Dockerfile and platform. |
+
+The job needs `id-token: write` from the caller. It is deliberately not a gate: the
+matrix legs still restore and still fall back to `skopeo` on a miss, so a failed or
+skipped warm up costs a pull rather than a deploy.
 
 ---
 
@@ -1340,6 +1409,48 @@ Globs are `fnmatch` patterns over dotted module names, so `app.common.db.dynamo.
 
 ---
 
+## `actions/base-image-cache`
+
+A composite action holding the base image restore, `skopeo` copy and save that
+`container-image.yml` runs before a build. It exists separately so
+[`base-image-cache.yml`](#base-image-cacheyml) can run the same logic once, ahead of a
+build matrix, and the two can never drift apart.
+
+```yaml
+      - id: base
+        uses: WebbPulse/.github/actions/base-image-cache@v3
+        with:
+          dockerfile: backend/Dockerfile
+          platform: linux/arm64
+          aws-region: us-west-2
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          ecr-registries: "432410731887"
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `dockerfile` | `Dockerfile` | Path to the Dockerfile whose `ARG BASE_IMAGE=` default is read. |
+| `working-directory` | `""` | Directory the dockerfile path resolves against. Empty means the workspace root. |
+| `platform` | `linux/arm64` | One platform. More than one skips the cache, since the layout holds one. |
+| `aws-region` | required | Region holding the ECR registries. |
+| `role-to-assume` | `""` | Role assumed via OIDC. Empty skips the credentials step. |
+| `ecr-registries` | `""` | Further registry account ids for the login. The caller's own account is always included. |
+| `skip-login` | `false` | `true` leaves the credentials and the ECR login to the caller, which is how `container-image.yml` calls it. |
+
+| Output | Notes |
+| --- | --- |
+| `enabled` | `true` when the cache applies, so `build-contexts` is worth passing on. |
+| `cache-key` | `base-image-v1-<sha256 of the reference plus the platform>`. |
+| `cache-hit` | `true` when the layout was restored rather than copied out of the registry. |
+| `layout-path` | Directory holding the OCI layout. |
+| `base-image` | The digest pinned reference read out of the Dockerfile. |
+| `build-contexts` | The `<reference>=oci-layout://<dir>@<digest>` line for `docker/build-push-action`, or empty when the cache does not apply. |
+
+Every skip path leaves `enabled` false and `build-contexts` empty rather than failing,
+so a build that cannot use the cache resolves its `FROM` exactly as it did before.
+
+---
+
 ## `actions/tfc-wait`
 
 A composite action holding the same HCP Terraform wait `spa-deploy.yml` runs inline, for
@@ -1630,6 +1741,7 @@ grant rather than merging with it, so the block above belongs on each calling jo
 
 | Workflow | Actions the role needs |
 | --- | --- |
+| `base-image-cache.yml` | `ecr:GetAuthorizationToken` (on `*`), plus `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on the base image repository. Read only, no push. |
 | `container-image.yml` | `ecr:GetAuthorizationToken` (on `*`), plus on the repository: `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`, `ecr:BatchGetImage` (the manifest assertion) |
 | `lambda-image-deploy.yml` | `lambda:UpdateFunctionCode`, `lambda:GetFunction` (the waiter polls it), and `lambda:PublishVersion` when `publish-version` is true |
 | `spa-deploy.yml` | `s3:ListBucket` on the bucket; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `bucket/*` (`DeleteObject` is needed by the prune pass); `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` on the distribution |

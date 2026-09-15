@@ -1,0 +1,134 @@
+name: Base Image Cache
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: "AWS region holding the ECR registries."
+        type: string
+        required: true
+      dockerfile:
+        description: "Path to the Dockerfile, relative to the workspace."
+        type: string
+        required: false
+        default: "Dockerfile"
+      working-directory:
+        description: >-
+          Directory the dockerfile path is resolved against. Empty resolves it against the
+          workspace root, which is what a caller passing a repo-relative path wants.
+        type: string
+        required: false
+        default: ""
+      platform:
+        description: "Single target platform, matching what the build matrix passes."
+        type: string
+        required: false
+        default: "linux/arm64"
+      additional-ecr-registries:
+        description: >-
+          Further ECR registry account ids to log in to, so the base image can be pulled
+          from another account. The caller's own account is always included.
+        type: string
+        required: false
+        default: ""
+      environment:
+        description: >-
+          GitHub Environment to bind the job to. A caller using a reusable workflow cannot
+          declare one itself, so it is passed here.
+        type: string
+        required: false
+        default: ""
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    secrets:
+      role-to-assume:
+        description: "IAM role ARN assumed via OIDC, allowed to read the base image repository."
+        required: true
+    outputs:
+      cache-key:
+        description: "The Actions cache key the build matrix will restore."
+        value: ${{ jobs.warm.outputs.cache-key }}
+      cache-hit:
+        description: "`true` when the layout was already cached, so nothing was pulled."
+        value: ${{ jobs.warm.outputs.cache-hit }}
+      base-image:
+        description: "The digest pinned base image reference read out of the Dockerfile."
+        value: ${{ jobs.warm.outputs.base-image }}
+      enabled:
+        description: "`true` when the cache applies to this Dockerfile and platform."
+        value: ${{ jobs.warm.outputs.enabled }}
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    name: Warm the base image cache
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      cache-key: ${{ steps.warm.outputs.cache-key }}
+      cache-hit: ${{ steps.warm.outputs.cache-hit }}
+      base-image: ${{ steps.warm.outputs.base-image }}
+      enabled: ${{ steps.warm.outputs.enabled }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Warm the base image cache
+        id: warm
+        uses: WebbPulse/.github/actions/base-image-cache@v3
+        with:
+          dockerfile: ${{ inputs.dockerfile }}
+          working-directory: ${{ inputs.working-directory }}
+          platform: ${{ inputs.platform }}
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ secrets.role-to-assume }}
+          ecr-registries: ${{ inputs.additional-ecr-registries }}
+
+      - name: Write the warm up result to the summary
+        env:
+          ENABLED: ${{ steps.warm.outputs.enabled }}
+          CACHE_KEY: ${{ steps.warm.outputs.cache-key }}
+          CACHE_HIT: ${{ steps.warm.outputs.cache-hit }}
+          BASE_IMAGE: ${{ steps.warm.outputs.base-image }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          if [ "$ENABLED" != "true" ]; then
+            echo "The base image cache does not apply to this Dockerfile and platform."
+            {
+              echo "## Base image cache"
+              echo
+              echo "The cache does not apply to this Dockerfile and platform, so the build matrix"
+              echo "resolves its \`FROM\` the way it did before the warm up existed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$CACHE_HIT" = "true" ]; then
+            STATUS="already cached, nothing pulled"
+          else
+            STATUS="pulled once and saved, so the matrix legs restore it"
+          fi
+          echo "Base image: ${BASE_IMAGE}"
+          echo "Cache key:  ${CACHE_KEY}"
+          echo "Status:     ${STATUS}"
+          {
+            echo "## Base image cache"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Base image | \`${BASE_IMAGE}\` |"
+            echo "| Platform | \`${PLATFORM}\` |"
+            echo "| Cache key | \`${CACHE_KEY}\` |"
+            echo "| Status | ${STATUS} |"
+          } >> "$GITHUB_STEP_SUMMARY"

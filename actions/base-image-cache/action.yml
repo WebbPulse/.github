@@ -1,0 +1,262 @@
+name: Base image cache
+description: >-
+  Keeps a single platform OCI layout of a Dockerfile's `ARG BASE_IMAGE=` default in the
+  Actions cache, so a container build resolves its `FROM` locally instead of pulling the
+  base image out of ECR. Reads the reference out of the Dockerfile, keys the cache on that
+  reference plus the platform, and on a miss copies the image with `skopeo` and saves it.
+  Everything is skipped, with `enabled` false and an empty `build-contexts`, when there is
+  no digest pinned `ARG BASE_IMAGE=` default or `platform` names more than one platform,
+  so a build that cannot use the cache behaves exactly as it did without it.
+
+inputs:
+  dockerfile:
+    description: "Path to the Dockerfile, relative to the workspace."
+    required: false
+    default: "Dockerfile"
+  working-directory:
+    description: >-
+      Directory the dockerfile path is resolved against. Empty resolves it against the
+      workspace root, which is what a caller passing a repo-relative path wants.
+    required: false
+    default: ""
+  platform:
+    description: >-
+      Single target platform, for example linux/arm64. More than one platform skips the
+      cache, since the layout holds one platform.
+    required: false
+    default: "linux/arm64"
+  aws-region:
+    description: "AWS region holding the ECR registries."
+    required: true
+  role-to-assume:
+    description: >-
+      IAM role ARN assumed via OIDC, allowed to read the base image repository. Empty
+      skips the credentials and the login, for a caller that has already configured both.
+    required: false
+    default: ""
+  ecr-registries:
+    description: >-
+      Comma separated ECR registry account ids to log in to, so the base image can be
+      pulled from another account. The caller's own account is always included. Empty
+      skips the login, for a caller that has already logged in.
+    required: false
+    default: ""
+  skip-login:
+    description: >-
+      `true` leaves the AWS credentials and the ECR login to the caller, whatever
+      role-to-assume and ecr-registries hold.
+    required: false
+    default: "false"
+
+outputs:
+  enabled:
+    description: "`true` when the cache applies, so `build-contexts` is worth passing on."
+    value: ${{ steps.base.outputs.enabled }}
+  cache-key:
+    description: "The Actions cache key, `base-image-v1-<sha256 of reference plus platform>`."
+    value: ${{ steps.base.outputs.cache-key }}
+  cache-hit:
+    description: "`true` when the layout was restored rather than copied out of the registry."
+    value: ${{ steps.base-cache.outputs.cache-hit }}
+  layout-path:
+    description: "Directory holding the OCI layout."
+    value: ${{ steps.base.outputs.layout-dir }}
+  base-image:
+    description: "The digest pinned base image reference read out of the Dockerfile."
+    value: ${{ steps.base.outputs.ref }}
+  build-contexts:
+    description: >-
+      The `<reference>=oci-layout://<dir>@<manifest digest>` line to hand
+      docker/build-push-action, or empty when the cache does not apply.
+    value: ${{ steps.layout.outputs.build-contexts }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials via OIDC
+      if: inputs.skip-login != 'true' && inputs.role-to-assume != ''
+      uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Assemble the ECR registry list
+      id: registries
+      if: inputs.skip-login != 'true'
+      shell: bash
+      env:
+        AWS_REGION_INPUT: ${{ inputs.aws-region }}
+        ADDITIONAL: ${{ inputs.ecr-registries }}
+      run: |
+        set -euo pipefail
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then
+          echo "Could not resolve the account id of the assumed role."
+          exit 1
+        fi
+        LIST=$(printf '%s\n%s\n' "$ACCOUNT_ID" "$ADDITIONAL" \
+          | tr ',' '\n' \
+          | tr -d '[:blank:]\r"' \
+          | grep -E '^[0-9]{12}$' \
+          | awk '!seen[$0]++' \
+          | paste -sd ',' - || true)
+        if [ -z "$LIST" ]; then
+          echo "No valid twelve digit account id resolved for the ECR login."
+          exit 1
+        fi
+        echo "Logging in to ECR registries: $LIST"
+        echo "registries=${LIST}" >> "$GITHUB_OUTPUT"
+        echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_INPUT}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+    - name: Log in to Amazon ECR
+      if: inputs.skip-login != 'true'
+      uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      with:
+        registries: ${{ steps.registries.outputs.registries }}
+
+    - name: Resolve the base image from the Dockerfile
+      id: base
+      shell: bash
+      env:
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+
+        echo "enabled=false" >> "$GITHUB_OUTPUT"
+
+        if [ -n "$WORKING_DIRECTORY" ]; then
+          DOCKERFILE="${WORKING_DIRECTORY%/}/${DOCKERFILE}"
+        fi
+
+        if [ ! -f "$DOCKERFILE" ]; then
+          echo "No Dockerfile at ${DOCKERFILE}. Leaving the base image to BuildKit."
+          exit 0
+        fi
+
+        case "$PLATFORM" in
+          *,*)
+            echo "platform holds more than one platform (${PLATFORM}). Skipping the base image cache."
+            exit 0
+            ;;
+        esac
+
+        OS="${PLATFORM%%/*}"
+        REST="${PLATFORM#*/}"
+        ARCH="${REST%%/*}"
+        VARIANT=""
+        case "$REST" in
+          */*) VARIANT="${REST#*/}" ;;
+        esac
+        if [ -z "$OS" ] || [ -z "$ARCH" ] || [ "$OS" = "$PLATFORM" ]; then
+          echo "Could not split ${PLATFORM} into an os and an architecture. Skipping the base image cache."
+          exit 0
+        fi
+
+        REF=$(sed -n 's/^[[:space:]]*ARG[[:space:]][[:space:]]*BASE_IMAGE=\(.*\)$/\1/p' "$DOCKERFILE" \
+          | head -n 1 \
+          | tr -d '"'"'"'"[:space:]')
+
+        if [ -z "$REF" ]; then
+          echo "No ARG BASE_IMAGE= default in ${DOCKERFILE}. Leaving the base image to BuildKit."
+          exit 0
+        fi
+
+        case "$REF" in
+          *@sha256:*) ;;
+          *)
+            echo "ARG BASE_IMAGE=${REF} is not pinned by digest. Skipping the base image cache."
+            exit 0
+            ;;
+        esac
+
+        BASE_DIGEST="${REF#*@}"
+        echo "Base image: ${REF}"
+        echo "Platform:   ${PLATFORM}"
+
+        {
+          echo "enabled=true"
+          echo "ref=${REF}"
+          echo "digest=${BASE_DIGEST}"
+          echo "os=${OS}"
+          echo "arch=${ARCH}"
+          echo "variant=${VARIANT}"
+          echo "layout-dir=${RUNNER_TEMP}/base-image-layout"
+          echo "cache-key=base-image-v1-$(printf '%s|%s' "$REF" "$PLATFORM" | sha256sum | cut -c1-64)"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore the base image layout
+      id: base-cache
+      if: steps.base.outputs.enabled == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.base.outputs.layout-dir }}
+        key: ${{ steps.base.outputs.cache-key }}
+
+    - name: Copy the base image into the layout
+      if: steps.base.outputs.enabled == 'true' && steps.base-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        REF: ${{ steps.base.outputs.ref }}
+        LAYOUT_DIR: ${{ steps.base.outputs.layout-dir }}
+        OS: ${{ steps.base.outputs.os }}
+        ARCH: ${{ steps.base.outputs.arch }}
+        VARIANT: ${{ steps.base.outputs.variant }}
+      run: |
+        set -euo pipefail
+        rm -rf "$LAYOUT_DIR"
+        mkdir -p "$LAYOUT_DIR"
+
+        VARIANT_ARGS=""
+        if [ -n "$VARIANT" ]; then
+          VARIANT_ARGS="--override-variant $VARIANT"
+        fi
+
+        echo "Pulling ${REF} for ${OS}/${ARCH}${VARIANT:+/$VARIANT} from the registry."
+        # shellcheck disable=SC2086
+        skopeo copy \
+          --override-os "$OS" \
+          --override-arch "$ARCH" \
+          $VARIANT_ARGS \
+          --authfile "${DOCKER_CONFIG:-$HOME/.docker}/config.json" \
+          "docker://${REF}" \
+          "oci:${LAYOUT_DIR}:base"
+
+    - name: Save the base image layout
+      if: steps.base.outputs.enabled == 'true' && steps.base-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.base.outputs.layout-dir }}
+        key: ${{ steps.base.outputs.cache-key }}
+
+    - name: Resolve the layout manifest digest
+      id: layout
+      if: steps.base.outputs.enabled == 'true'
+      shell: bash
+      env:
+        LAYOUT_DIR: ${{ steps.base.outputs.layout-dir }}
+        REF: ${{ steps.base.outputs.ref }}
+      run: |
+        set -euo pipefail
+
+        echo "build-contexts=" >> "$GITHUB_OUTPUT"
+
+        if [ ! -f "${LAYOUT_DIR}/index.json" ]; then
+          echo "No OCI layout at ${LAYOUT_DIR}. Leaving the base image to BuildKit."
+          exit 0
+        fi
+
+        MANIFEST_DIGEST=$(jq -r '[.manifests[]
+          | select(.mediaType == "application/vnd.oci.image.manifest.v1+json"
+                or .mediaType == "application/vnd.docker.distribution.manifest.v2+json")
+          | .digest] | first // empty' "${LAYOUT_DIR}/index.json")
+
+        if [ -z "$MANIFEST_DIGEST" ]; then
+          echo "The layout index holds no single platform manifest. Leaving the base image to BuildKit."
+          cat "${LAYOUT_DIR}/index.json"
+          exit 0
+        fi
+
+        echo "Serving ${REF} from ${LAYOUT_DIR} at ${MANIFEST_DIGEST}."
+        echo "build-contexts=${REF}=oci-layout://${LAYOUT_DIR}@${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
