@@ -15,12 +15,11 @@ names live here. Every one of those values arrives from the calling repository a
   workflow is documented in
   [`.github/workflows/README.md`](.github/workflows/README.md).
 - **`actions/`** contains composite actions:
-  [`actions/tfc-wait`](actions/tfc-wait/action.yml), which holds until an HCP Terraform
-  workspace can no longer change infrastructure under a deploy, for a repository whose
-  deploy is a plain job rather than a call into a reusable workflow; and
   [`actions/affected-domains`](actions/affected-domains/action.yml), which works out which
   backend domains a diff affects so CI shards and deploys run only for the domains whose
-  code changed.
+  code changed; and
+  [`actions/base-image-cache`](actions/base-image-cache/action.yml), which resolves and
+  caches a Dockerfile's base image so a build matrix pulls it once.
 - **`profile/README.md`** is the organisation profile rendered on the WebbPulse GitHub
   organisation page.
 
