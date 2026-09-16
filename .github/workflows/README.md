@@ -727,6 +727,17 @@ because a new build gives them new keys. `invalidation-paths` appends extra path
 `/*` invalidates everything. The invalidation then waits for completion so the job does
 not report success before the edge is serving the build.
 
+**Most callers should turn the invalidation off.** Pass two uploads the entry files with
+`no-cache, no-store, must-revalidate`, and the `spa-frontend` module's default cache policy
+is the managed CachingOptimized policy, whose minimum TTL is one second. CloudFront therefore
+holds an entry file for about a second and refetches it from S3, so a deploy is live on the
+next request with or without an invalidation. CloudFront bills invalidations per path
+submitted, the first 1000 a month free and shared across the whole organisation under
+consolidated billing, then USD 0.005 each, and a viewer request function that rewrites
+`/about` to `/about/index.html` means the cache key is the rewritten path, so listing
+`/about` matches nothing. Set `invalidate-cloudfront: false` unless the distribution gives
+the entry files a real TTL; in that case invalidate `/*`, which counts as one path.
+
 **Private packages.** A frontend that imports the shared `@webbpulse/*` packages needs
 `codeartifact-domain`, `codeartifact-repository` and the `codeartifact-domain-owner`
 secret. The login runs from the repository root, before the install, so `npm ci`
@@ -748,7 +759,8 @@ and the role is assumed after the build, exactly as before.
 | `s3-bucket` | string | required | |
 | `s3-prefix` | string | `""` | Optional key prefix. |
 | `cloudfront-distribution-id` | string | `""` | Empty skips the invalidation. |
-| `invalidation-paths` | string | `""` | Space separated **extra** paths. `/index.html` and `/` are always invalidated. |
+| `invalidate-cloudfront` | boolean | `true` | `false` skips the invalidation even when a distribution id is set. The right value for a distribution whose entry files carry `no-cache` under a minimum TTL of a second or less. |
+| `invalidation-paths` | string | `""` | Space separated **extra** paths. `/index.html` and `/` are always invalidated. Ignored when `invalidate-cloudfront` is `false`. |
 | `immutable-asset-globs` | string | `assets/*` | Files treated as content hashed. |
 | `aws-region` | string | required | |
 | `environment` | string | `""` | GitHub Environment. |
@@ -776,6 +788,7 @@ jobs:
       environment: production
       s3-bucket: ${{ vars.FRONTEND_S3_BUCKET }}
       cloudfront-distribution-id: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      invalidate-cloudfront: false
       aws-region: ${{ vars.AWS_REGION }}
       codeartifact-domain: ${{ vars.CODEARTIFACT_DOMAIN }}
       codeartifact-repository: ${{ vars.CODEARTIFACT_REPOSITORY }}
@@ -1691,7 +1704,7 @@ grant rather than merging with it, so the block above belongs on each calling jo
 | `base-image-cache.yml` | `ecr:GetAuthorizationToken` (on `*`), plus `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on the base image repository. Read only, no push. |
 | `container-image.yml` | `ecr:GetAuthorizationToken` (on `*`), plus on the repository: `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`, `ecr:BatchGetImage` (the manifest assertion) |
 | `lambda-image-deploy.yml` | `lambda:UpdateFunctionCode`, `lambda:GetFunction` (the waiter polls it), and `lambda:PublishVersion` when `publish-version` is true |
-| `spa-deploy.yml` | `s3:ListBucket` on the bucket; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `bucket/*` (`DeleteObject` is needed by the prune pass); `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` on the distribution |
+| `spa-deploy.yml` | `s3:ListBucket` on the bucket; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `bucket/*` (`DeleteObject` is needed by the prune pass); `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` on the distribution, only when `invalidate-cloudfront` is true |
 | `codeartifact-publish-*.yml` | `sts:GetServiceBearerToken` (on `*`), `codeartifact:GetAuthorizationToken` on the domain, and on the repository `codeartifact:PublishPackageVersion`, `codeartifact:PutPackageMetadata`, `codeartifact:ReadFromRepository`, `codeartifact:DescribePackageVersion` |
 | `python-ci.yml` / `typescript-ci.yml` | Only when the CodeArtifact login is enabled: `sts:GetServiceBearerToken`, `codeartifact:GetAuthorizationToken`, `codeartifact:ReadFromRepository`. Read only, no publish. |
 | `terraform-speculative-plan.yml` | No AWS role. It needs only the HCP token secret. |
