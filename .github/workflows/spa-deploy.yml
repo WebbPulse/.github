@@ -61,10 +61,19 @@ on:
         type: string
         required: false
         default: ""
+      invalidate-cloudfront:
+        description: >-
+          Whether to invalidate the distribution after the sync. Entry files uploaded with
+          no-cache under a cache policy whose minimum TTL is a second or less are refetched
+          on the next request anyway, so a caller in that shape sets this to false and pays
+          for no invalidation paths.
+        type: boolean
+        required: false
+        default: true
       invalidation-paths:
         description: >-
           Extra space separated CloudFront invalidation paths. / and /index.html are always
-          invalidated; /* invalidates everything.
+          invalidated; /* invalidates everything. Ignored when invalidate-cloudfront is false.
         type: string
         required: false
         default: ""
@@ -309,7 +318,7 @@ jobs:
             --delete
 
       - name: Invalidate CloudFront
-        if: inputs.cloudfront-distribution-id != ''
+        if: inputs.cloudfront-distribution-id != '' && inputs.invalidate-cloudfront
         env:
           DISTRIBUTION_ID: ${{ inputs.cloudfront-distribution-id }}
           INVALIDATION_PATHS: ${{ inputs.invalidation-paths }}
