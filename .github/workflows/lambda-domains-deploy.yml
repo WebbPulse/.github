@@ -817,6 +817,8 @@ jobs:
           MAP=$(python3 -c 'import json; print(json.dumps(json.load(open("deploy-map.json"))))')
           echo "function-image-map=${MAP}" >> "$GITHUB_OUTPUT"
 
+          # shellcheck disable=SC2016 # the $/ in the sed scripts below is an end anchor,
+          # not a shell expansion, so the single quotes are deliberate.
           {
             echo "## Deploy targets"
             echo
