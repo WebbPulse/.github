@@ -699,6 +699,372 @@ jobs:
 
 ---
 
+## `lambda-domains-deploy.yml`
+
+The whole backend deploy for a repository whose backend ships as **one image per domain
+onto one Lambda function per domain**. It is the eight job pipeline three products were
+each carrying a private copy of, hoisted verbatim: resolve the environment, work out the
+affected domains, warm the base image cache, build the images, assemble the function image
+map, drop the functions that do not exist yet, point each function at its new image, and
+smoke test each one.
+
+It composes [`base-image-cache.yml`](#base-image-cacheyml),
+[`container-image.yml`](#container-imageyml) and
+[`lambda-image-deploy.yml`](#lambda-image-deployyml) rather than reimplementing any of
+them, and calls [`actions/affected-domains`](#actionsaffected-domains) for the diff. None
+of those contracts changed.
+
+A caller is a trigger block and a `uses:`. Everything product specific is an input.
+
+### Why the products were 91 percent identical
+
+The three copies shared all eight jobs in the same order and a byte identical 68 line
+`resolve-env`. What actually differed was the ECR repository and Lambda function naming,
+one product's stream consumer table, one product's `prod` resource slug, and a handful of
+log lines. Those are the inputs below; everything else is now in one place.
+
+### Nesting depth
+
+GitHub allows "a maximum of ten levels of workflows - that is, the top-level caller
+workflow and up to nine levels of reusable workflows". A product's `deploy-backend.yml` is
+level one, this workflow is level two, and the three workflows it calls are level three,
+so there are seven levels of headroom. A `strategy: matrix` on a job that `uses:` a
+reusable workflow is explicitly supported, which is what the build fan out relies on.
+
+Two GitHub rules shape the design and are worth knowing before changing it:
+
+- **A job with `uses:` can carry neither `steps:` nor `environment:`.** That is why
+  `resolve-env` exists as a plain job: it binds to the GitHub Environment, reads the
+  environment scoped `vars`, and exports them as job outputs for the `uses:` jobs, which
+  take the environment name through each called workflow's `environment` input instead.
+- **A matrix of reusable workflow calls collapses to one `needs` entry** whose `outputs`
+  hold whichever leg finished last. The build legs therefore each upload a one file
+  manifest and `image-map` collects them, exactly as `container-image.yml` documents.
+
+**The inner calls pin `@v3`, not the caller's ref.** A product that pins this workflow to an
+exact `v3.x.y` still runs the three composed workflows at whatever `v3` points to, because a
+reusable workflow names its own dependencies. Moving the `v3` tag therefore changes what an
+exactly pinned caller runs one level down.
+
+**Secrets do not propagate through nesting.** In the chain caller to this workflow to
+`container-image.yml`, a secret reaches the innermost workflow only because it is passed
+at each hop. This workflow takes no `secrets:` at all: the deploy role ARN is read from
+the GitHub Environment as a **variable**, by name, so the caller has nothing to forward.
+See [The role ARN is a variable, not a secret](#the-role-arn-is-a-variable-not-a-secret).
+
+### The two name templates
+
+`ecr-repository-template` and `function-name-template` are the whole of the naming
+difference between the products. Three placeholders are substituted:
+
+| Placeholder | Expands to |
+| --- | --- |
+| `{domain}` | The domain, hyphenated unless `hyphenate-domain-names` is false. |
+| `{environment}` | The resolved GitHub Environment name, for example `production`. |
+| `{env-slug}` | That name mapped through `env-slug-map-json`, for a product whose resources say `prod` where the environment says `production`. |
+
+```yaml
+ecr-repository-template: myproduct-{environment}/{domain}
+function-name-template: myproduct-{environment}-{domain}
+```
+
+```yaml
+# A product whose resource names use a short slug and a fixed repository namespace.
+ecr-repository-template: myproduct-terraform/{domain}
+function-name-template: myproduct-terraform-{env-slug}-{domain}
+env-slug-map-json: '{"production": "prod"}'
+```
+
+Substitution happens in Python, in the `affected` and `image-map` jobs, because GitHub
+expressions have **no string replace function**; a `{domain}` template cannot be expanded
+in a `with:` block. The `affected` job therefore emits a matrix of `{domain, repository}`
+objects and each build leg reads `matrix.leg.repository`.
+
+### Stream consumers
+
+A consumer runs the image of the domain it belongs to, under a different entrypoint set in
+the product's infrastructure. Declare them and each one is added to the map alongside its
+domain:
+
+```yaml
+consumers-json: >-
+  {"catalog": ["catalog-votes-consumer", "catalog-part-purge-consumer"],
+   "users": ["users-delete-consumer"]}
+```
+
+Each name is expanded through `function-name-template` in place of `{domain}`. **A
+consumer is only ever added when its domain was rebuilt in this run**, so on a partial
+deploy a consumer whose domain did not change keeps the image it is already on. Consumers
+are excluded from the smoke probe by `smoke-exclude-suffix`, which defaults to
+`-consumer`, because they have no API Gateway route to answer `GET /health`.
+
+### The role ARN is a variable, not a secret
+
+The deploy role ARN is read from `vars.AWS_DEPLOY_ROLE_ARN` on the resolved environment,
+named by `role-arn-variable`, rather than passed as a secret. A role ARN is an identifier
+protected by its trust policy, not a credential, and reading it on the environment is what
+makes the caller a trigger block with no `secrets:` block at all. It is also what keeps the
+staging and production ARNs impossible to cross: the value is scoped to the Environment the
+branch resolved to.
+
+The same applies to the two enablement flags and the CodeArtifact domain owner: the
+workflow reads them by variable **name** on the resolved environment, because `vars` on
+the caller resolves against the repository rather than against the environment this run
+targets. That is also why the build and deploy gates are evaluated inside `resolve-env`
+rather than in a job level `if:`.
+
+### `fresh-dependencies`
+
+A manual redeploy has to be able to pick up a newly published shared package on a commit
+that is already deployed. The input does three things at once, and all three are needed:
+
+1. The dependency stamp becomes the run id rather than the newest published version, so
+   the layer that resolves dependencies rebuilds.
+2. Every domain rebuilds, because the diff base is dropped.
+3. `image-tag-suffix` becomes `deps-<run id>`, giving the run its own immutable tag, so
+   `skip-if-tag-exists` does not skip a build on an already built commit and a new digest
+   is actually pushed.
+
+Without the third, a green deploy run is not proof a new image shipped. Expose the input
+on the caller's `workflow_dispatch` and pass it straight through.
+
+`dependency-package` is what the stamp is read from. Leave it empty and no
+`DEPENDENCY_RESOLUTION` build argument is passed at all, which suits a repository that is
+itself the shared package.
+
+### Changed path gating
+
+`extra-full-paths` is passed to `actions/affected-domains`; a caller lists its own deploy
+workflow path and its Terraform paths, and a change to any of them rebuilds every domain.
+The diff base is the head sha of the last **successful** run of the caller's workflow on
+this branch, resolved from the Actions API, so a run that failed part way never becomes a
+base and the next run rebuilds whatever it left behind. A manual dispatch and an
+unresolvable base both yield every domain.
+
+`deploy-workflow-file` defaults to the caller's own file name, derived from
+`github.workflow_ref`, so a caller does not name itself.
+
+### Inputs
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `aws-region` | string | **required** | Region holding the ECR repositories and the functions. |
+| `ecr-repository-template` | string | **required** | See [The two name templates](#the-two-name-templates). |
+| `function-name-template` | string | **required** | As above. |
+| `production-branch` | string | `main` | Branch whose pushes deploy production. |
+| `production-environment` | string | `production` | Environment used on that branch. |
+| `staging-environment` | string | `staging` | Environment used on every other branch. |
+| `build-enabled-variable` | string | `BACKEND_IMAGE_BUILD_ENABLED` | Variable that must equal `true` before anything builds. Empty runs unconditionally. |
+| `deploy-enabled-variable` | string | `BACKEND_IMAGE_DEPLOY_ENABLED` | Variable that must equal `true` before any function is updated. Images still build when false. |
+| `staging-enabled-variable` | string | `""` | Extra gate for non production branches only. |
+| `role-arn-variable` | string | `AWS_DEPLOY_ROLE_ARN` | Environment variable holding the deploy role ARN. |
+| `env-slug-map-json` | string | `{}` | Maps an environment name to the `{env-slug}` value. |
+| `consumers-json` | string | `{}` | Domain to extra function suffixes. See [Stream consumers](#stream-consumers). |
+| `working-directory` | string | `backend` | Python project root, for `affected-domains`. |
+| `dockerfile` | string | `backend/Dockerfile` | Dockerfile every domain image is built from. |
+| `build-context` | string | `backend` | Docker build context. |
+| `platform` | string | `linux/arm64` | Exactly one platform. Lambda rejects a multi architecture image. |
+| `hyphenate-domain-names` | boolean | `true` | Translate the underscored Python package name to the hyphenated deploy spelling. |
+| `unattributed` | string | `all` | Passed to `affected-domains`. `none` suits a tree with a reachability test. |
+| `extra-full-paths` | string | `""` | Globs that force every domain, one per line. |
+| `deploy-workflow-file` | string | `""` | Workflow file whose last green run is the diff base. Empty derives the caller's own. |
+| `fresh-dependencies` | boolean | `false` | See [`fresh-dependencies`](#fresh-dependencies). |
+| `dependency-package` | string | `""` | Package whose newest version stamps the layer. Empty passes no build argument. |
+| `dependency-package-format` | string | `pypi` | CodeArtifact format for that package. |
+| `codeartifact-domain` | string | `""` | Empty skips the build token and the stamp lookup. |
+| `codeartifact-repository` | string | `""` | Required with `codeartifact-domain`. |
+| `codeartifact-domain-owner-variable` | string | `CODEARTIFACT_DOMAIN_OWNER` | Environment variable holding the owning account id. |
+| `additional-ecr-registries` | string | `""` | Further registry account ids, for a cross account base image. |
+| `warm-base-image` | boolean | `true` | Run the warm up once before the matrix fans out. |
+| `skip-if-tag-exists` | boolean | `true` | Skip a build whose immutable tag already resolves. |
+| `publish-version` | boolean | `true` | Publish a Lambda version after each update. |
+| `run-smoke` | boolean | `true` | Invoke each deployed function with a synthetic `GET /health`. |
+| `smoke-exclude-suffix` | string | `-consumer` | Function suffix excluded from the probe. Empty probes everything. |
+| `smoke-user-agent` | string | `""` | Empty derives `<repository>-deploy-smoke`. |
+| `bootstrap-note` | string | see below | Summary line shown when no function exists yet. |
+| `concurrency-group` | string | `""` | For the deploy job. Empty derives one from the environment. |
+| `runs-on` | string | `ubuntu-latest` | Runner label. |
+
+`bootstrap-note` defaults to "The first apply that creates the functions is what the next
+run deploys to."
+
+**Secrets: none.** Everything the workflow needs is an input or an environment variable.
+
+| Output | Notes |
+| --- | --- |
+| `environment` | The GitHub Environment this run resolved to. |
+| `env-slug` | The resource slug that environment maps to. |
+| `domains` | JSON array of the domains built, in the deploy spelling. |
+| `any` | `true` when at least one domain was affected. |
+| `reason` | One human readable line explaining the scope verdict. |
+| `base` | The commit the diff was taken from. Empty means unknown, so every domain. |
+| `dependency-stamp` | The value stamped into `DEPENDENCY_RESOLUTION`. |
+| `function-image-map` | Every function to its digest pinned image URI, before the existence filter. |
+| `deployed-function-image-map` | The same map filtered to the functions that exist, which is what was deployed. |
+
+### What the caller must grant
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+```
+
+`actions: read` is what lets the base commit resolution poll previous runs of the
+workflow. `id-token: write` is required because a called workflow can never hold a
+permission its caller did not, and every job here assumes a role through OIDC.
+
+### The callers
+
+Three products collapse to these. Each was between 554 and 596 lines.
+
+**CarModPicker.** Stream consumers, a reachability test that makes `unattributed: none`
+safe, and a bootstrap note pointing at its split plan.
+
+```yaml
+name: Deploy Backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      fresh-dependencies:
+        description: >-
+          Force a fresh dependency resolution instead of keying the layer on the
+          newest published webbpulse version. The images are pushed under their own
+          tag, so this rebuilds and redeploys even on a commit that is already
+          deployed.
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main, staging]
+    paths:
+      - "backend/**"
+      - "!backend/tests/**"
+      - "!backend/e2e/**"
+      - "!backend/scripts/**"
+      - "!backend/README.md"
+      - "!backend/docs/**"
+      - ".github/workflows/deploy-backend.yml"
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: backend-images-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/lambda-domains-deploy.yml@v3
+    with:
+      aws-region: us-west-2
+      ecr-repository-template: carmodpicker-{environment}/{domain}
+      function-name-template: carmodpicker-{environment}-{domain}
+      unattributed: none
+      fresh-dependencies: ${{ inputs.fresh-dependencies || false }}
+      dependency-package: webbpulse
+      codeartifact-domain: webbpulse
+      codeartifact-repository: python
+      additional-ecr-registries: ${{ vars.ARTIFACTS_ACCOUNT_ID }}
+      concurrency-group: backend-image-deploy-${{ github.ref_name }}
+      bootstrap-note: >-
+        Row 13 of the split plan creates the first function and the next run
+        deploys it.
+      extra-full-paths: |
+        .github/workflows/deploy-backend.yml
+      consumers-json: >-
+        {"catalog": ["catalog-votes-consumer", "catalog-part-purge-consumer"],
+         "admin": ["admin-price-alerts-consumer"],
+         "users": ["users-delete-consumer"]}
+```
+
+**Standupless.** The same shape with its own consumer table and the default
+`unattributed: all`.
+
+```yaml
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/lambda-domains-deploy.yml@v3
+    with:
+      aws-region: us-west-2
+      ecr-repository-template: standupless-{environment}/{domain}
+      function-name-template: standupless-{environment}-{domain}
+      fresh-dependencies: ${{ inputs.fresh-dependencies || false }}
+      dependency-package: webbpulse
+      codeartifact-domain: webbpulse
+      codeartifact-repository: python
+      additional-ecr-registries: ${{ vars.ARTIFACTS_ACCOUNT_ID }}
+      extra-full-paths: |
+        .github/workflows/deploy-backend.yml
+      consumers-json: >-
+        {"views": ["views-notify-consumer", "views-search-consumer"],
+         "planning": ["planning-rollup-consumer"],
+         "integrations": ["integrations-events-consumer",
+                          "integrations-dispatch-consumer",
+                          "integrations-stream-consumer"]}
+```
+
+**WebbPulse-Terraform.** A `prod` resource slug, a fixed repository namespace with no
+environment in it, no consumers, an extra staging gate, and `skip-if-tag-exists: false`.
+
+```yaml
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/lambda-domains-deploy.yml@v3
+    with:
+      aws-region: us-west-2
+      ecr-repository-template: webbpulse-terraform/{domain}
+      function-name-template: webbpulse-terraform-{env-slug}-{domain}
+      env-slug-map-json: '{"production": "prod"}'
+      staging-enabled-variable: STAGING_DEPLOY_ENABLED
+      skip-if-tag-exists: false
+      smoke-exclude-suffix: ""
+      fresh-dependencies: ${{ inputs.fresh-dependencies || false }}
+      dependency-package: webbpulse
+      codeartifact-domain: webbpulse
+      codeartifact-repository: python
+      additional-ecr-registries: ${{ vars.ARTIFACTS_ACCOUNT_ID }}
+      concurrency-group: backend-deploy-${{ github.ref_name }}
+      bootstrap-note: >-
+        The first apply with a non-empty bootstrap_image_tag creates the
+        functions and the next run deploys them.
+      extra-full-paths: |
+        .github/workflows/deploy-backend.yml
+```
+
+`inputs.fresh-dependencies || false` is what makes the input work on both triggers: on a
+`push` there is no `inputs` context, so the fallback supplies the boolean the input
+requires.
+
+### What stayed in the caller, and why
+
+- **The `on:` block.** A reusable workflow cannot declare its own triggers, and the path
+  filter is the product's own answer to which changes deploy.
+- **`concurrency` at the workflow level.** The group has to be evaluated in the caller's
+  context to serialise that repository's runs.
+- **The `workflow_dispatch` input declaration.** Only the caller can expose it in the
+  Actions UI, so it is declared there and passed through.
+- **The additional ECR registry account id**, which is estate specific and so reaches the
+  workflow as a caller `vars` entry rather than living here.
+
+---
+
 ## `spa-deploy.yml`
 
 Builds the frontend, syncs to S3 in three passes, and invalidates CloudFront. An

@@ -1,0 +1,974 @@
+name: Lambda Domains Deploy
+
+on:
+  workflow_call:
+    inputs:
+      production-branch:
+        description: "Branch whose pushes deploy production. Every other branch resolves to the staging environment."
+        type: string
+        required: false
+        default: "main"
+      production-environment:
+        description: "GitHub Environment name used on production-branch."
+        type: string
+        required: false
+        default: "production"
+      staging-environment:
+        description: "GitHub Environment name used on every other branch."
+        type: string
+        required: false
+        default: "staging"
+      build-enabled-variable:
+        description: >-
+          Name of the environment variable that must equal 'true' before anything builds.
+          Empty runs unconditionally. Read on the resolved environment, so a stage can be
+          turned off without editing the caller.
+        type: string
+        required: false
+        default: "BACKEND_IMAGE_BUILD_ENABLED"
+      deploy-enabled-variable:
+        description: >-
+          Name of the environment variable that must equal 'true' before any function is
+          updated. Empty deploys whenever images were built. Images are still built and
+          pushed when this is false, so a later apply can adopt them.
+        type: string
+        required: false
+        default: "BACKEND_IMAGE_DEPLOY_ENABLED"
+      staging-enabled-variable:
+        description: >-
+          Name of an environment variable that additionally gates non production branches.
+          Empty leaves staging ungated. Production is never gated by it.
+        type: string
+        required: false
+        default: ""
+      aws-region:
+        description: "AWS region holding the ECR repositories and the Lambda functions."
+        type: string
+        required: true
+      role-arn-variable:
+        description: "Environment variable holding the deploy role ARN. Read on the resolved environment."
+        type: string
+        required: false
+        default: "AWS_DEPLOY_ROLE_ARN"
+      working-directory:
+        description: "Directory holding the Python project, relative to the repository root."
+        type: string
+        required: false
+        default: "backend"
+      dockerfile:
+        description: "Path to the Dockerfile every domain image is built from."
+        type: string
+        required: false
+        default: "backend/Dockerfile"
+      build-context:
+        description: "Docker build context."
+        type: string
+        required: false
+        default: "backend"
+      platform:
+        description: "Single target platform. Lambda rejects multi architecture images."
+        type: string
+        required: false
+        default: "linux/arm64"
+      ecr-repository-template:
+        description: >-
+          ECR repository for one domain. `{environment}`, `{env-slug}` and `{domain}` are
+          substituted, for example `myproduct-{environment}/{domain}`.
+        type: string
+        required: true
+      function-name-template:
+        description: >-
+          Lambda function name for one domain. `{environment}`, `{env-slug}` and `{domain}`
+          are substituted, for example `myproduct-{environment}-{domain}`.
+        type: string
+        required: true
+      env-slug-map-json:
+        description: >-
+          JSON object mapping an environment name to the slug `{env-slug}` expands to, for
+          example {"production":"prod"}. An environment absent from the map keeps its own name.
+        type: string
+        required: false
+        default: "{}"
+      consumers-json:
+        description: >-
+          JSON object mapping a domain to the extra function name suffixes that run that
+          domain's image under a different entrypoint, for example
+          {"catalog":["catalog-votes-consumer"]}. Each suffix is expanded through
+          function-name-template in place of `{domain}`. A consumer is only added when its
+          domain was rebuilt in this run, so a partial deploy leaves an unrebuilt consumer
+          on the image it already has.
+        type: string
+        required: false
+        default: "{}"
+      smoke-exclude-suffix:
+        description: >-
+          Function name suffix excluded from the /health probe, for functions with no API
+          Gateway route. Empty probes every deployed function.
+        type: string
+        required: false
+        default: "-consumer"
+      hyphenate-domain-names:
+        description: >-
+          Translate the underscored Python package name the affected-domains action reports
+          into the hyphenated spelling the ECR repository, Lambda function and route key use.
+        type: boolean
+        required: false
+        default: true
+      unattributed:
+        description: >-
+          Passed to actions/affected-domains. `all` is the safe reading; `none` suits a tree
+          whose reachability test already forbids an unreached file under app/.
+        type: string
+        required: false
+        default: "all"
+      extra-full-paths:
+        description: >-
+          Repo-relative globs, one per line, that force every domain. The caller's own deploy
+          workflow path belongs here.
+        type: string
+        required: false
+        default: ""
+      deploy-workflow-file:
+        description: >-
+          Workflow file name whose last successful run on this branch is the diff base.
+          Defaults to this run's own workflow file.
+        type: string
+        required: false
+        default: ""
+      fresh-dependencies:
+        description: >-
+          Force a fresh dependency resolution instead of keying the layer on the newest
+          published package version. Images are pushed under their own tag, so this rebuilds
+          and redeploys even on a commit that is already deployed, and every domain rebuilds.
+        type: boolean
+        required: false
+        default: false
+      dependency-package:
+        description: >-
+          CodeArtifact package whose newest published version stamps the dependency layer.
+          Empty passes no DEPENDENCY_RESOLUTION build argument at all.
+        type: string
+        required: false
+        default: ""
+      dependency-package-format:
+        description: "CodeArtifact package format for dependency-package."
+        type: string
+        required: false
+        default: "pypi"
+      codeartifact-domain:
+        description: "CodeArtifact domain. Empty skips the build token and the dependency stamp lookup."
+        type: string
+        required: false
+        default: ""
+      codeartifact-repository:
+        description: "CodeArtifact repository name. Required when codeartifact-domain is set."
+        type: string
+        required: false
+        default: ""
+      codeartifact-domain-owner-variable:
+        description: "Environment variable holding the account id that owns the CodeArtifact domain."
+        type: string
+        required: false
+        default: "CODEARTIFACT_DOMAIN_OWNER"
+      additional-ecr-registries:
+        description: >-
+          Further ECR registry account ids to log in to, so a FROM can pull a cross account
+          base image. The caller's own account is always included.
+        type: string
+        required: false
+        default: ""
+      warm-base-image:
+        description: "Run the base image cache warm up once before the build matrix fans out."
+        type: boolean
+        required: false
+        default: true
+      skip-if-tag-exists:
+        description: "Skip a build whose immutable tag already resolves, and reuse the existing digest."
+        type: boolean
+        required: false
+        default: true
+      publish-version:
+        description: "Publish a new Lambda version after each code update."
+        type: boolean
+        required: false
+        default: true
+      run-smoke:
+        description: "Invoke each deployed domain function with a synthetic GET /health event."
+        type: boolean
+        required: false
+        default: true
+      smoke-user-agent:
+        description: "User agent recorded in the synthetic smoke event. Empty derives one from the repository name."
+        type: string
+        required: false
+        default: ""
+      bootstrap-note:
+        description: >-
+          Line shown in the summary when no domain function exists yet, to point a reader at
+          whatever creates them in this product.
+        type: string
+        required: false
+        default: "The first apply that creates the functions is what the next run deploys to."
+      concurrency-group:
+        description: "Concurrency group for the deploy job. Empty derives one from the resolved environment."
+        type: string
+        required: false
+        default: ""
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+
+    outputs:
+      environment:
+        description: "The GitHub Environment this run resolved to."
+        value: ${{ jobs.resolve-env.outputs.name }}
+      env-slug:
+        description: "The resource name slug the environment maps to."
+        value: ${{ jobs.resolve-env.outputs.env-slug }}
+      domains:
+        description: "JSON array of the domains this run built, in the deploy spelling."
+        value: ${{ jobs.affected.outputs.domains }}
+      any:
+        description: "`true` when at least one domain was affected."
+        value: ${{ jobs.affected.outputs.any }}
+      reason:
+        description: "One human readable line explaining the deploy scope verdict."
+        value: ${{ jobs.affected.outputs.reason }}
+      base:
+        description: "The commit the diff was taken from. Empty means unknown, which yields every domain."
+        value: ${{ jobs.affected.outputs.base }}
+      dependency-stamp:
+        description: "The value stamped into the DEPENDENCY_RESOLUTION build argument."
+        value: ${{ jobs.resolve-env.outputs.dependency-stamp }}
+      function-image-map:
+        description: "JSON object of every function name to its digest pinned image URI, before the existence filter."
+        value: ${{ jobs.image-map.outputs.function-image-map }}
+      deployed-function-image-map:
+        description: "The same map filtered to the functions that already exist, which is what was deployed."
+        value: ${{ jobs.existing-functions.outputs.function-image-map }}
+
+permissions: {}
+
+jobs:
+  resolve-env:
+    name: Resolve deploy environment
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ github.ref_name == inputs.production-branch && inputs.production-environment || inputs.staging-environment }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      name: ${{ steps.values.outputs.name }}
+      env-slug: ${{ steps.values.outputs.env-slug }}
+      role-arn: ${{ steps.values.outputs.role-arn }}
+      enabled: ${{ steps.values.outputs.enabled }}
+      deploy-enabled: ${{ steps.values.outputs.deploy-enabled }}
+      domain-owner: ${{ steps.values.outputs.domain-owner }}
+      dependency-stamp: ${{ steps.stamp.outputs.dependency-stamp }}
+    steps:
+      # A job that `uses:` a reusable workflow can neither declare `environment:` nor read
+      # environment scoped `vars`, so this job binds to the environment and exports every
+      # value the rest of the run needs. The gating variables are read here too, rather than
+      # in a job level `if:`, because `vars` on the caller resolves against the repository
+      # rather than against the environment this run targets.
+      - name: Resolve the environment values
+        id: values
+        env:
+          ENVIRONMENT: ${{ github.ref_name == inputs.production-branch && inputs.production-environment || inputs.staging-environment }}
+          IS_PRODUCTION: ${{ github.ref_name == inputs.production-branch }}
+          ENV_SLUG_MAP: ${{ inputs.env-slug-map-json }}
+          ROLE_ARN_VARIABLE: ${{ inputs.role-arn-variable }}
+          BUILD_ENABLED_VARIABLE: ${{ inputs.build-enabled-variable }}
+          DEPLOY_ENABLED_VARIABLE: ${{ inputs.deploy-enabled-variable }}
+          STAGING_ENABLED_VARIABLE: ${{ inputs.staging-enabled-variable }}
+          DOMAIN_OWNER_VARIABLE: ${{ inputs.codeartifact-domain-owner-variable }}
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          DEPENDENCY_PACKAGE: ${{ inputs.dependency-package }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+
+          lookup() {
+            [ -n "$1" ] || { printf ''; return 0; }
+            NAME="$1" python3 -c '
+          import json, os, sys
+          print(json.loads(os.environ["VARS_JSON"]).get(os.environ["NAME"], ""))
+          '
+          }
+
+          ROLE_TO_ASSUME="$(lookup "$ROLE_ARN_VARIABLE")"
+          if [ -z "$ROLE_TO_ASSUME" ]; then
+            echo "::error::vars.${ROLE_ARN_VARIABLE} is not set on the ${ENVIRONMENT} environment."
+            exit 1
+          fi
+
+          ENV_SLUG=$(ENVIRONMENT="$ENVIRONMENT" python3 -c '
+          import json, os
+          env = os.environ["ENVIRONMENT"]
+          print(json.loads(os.environ["ENV_SLUG_MAP"]).get(env, env))
+          ')
+
+          ENABLED=true
+          if [ -n "$BUILD_ENABLED_VARIABLE" ] && [ "$(lookup "$BUILD_ENABLED_VARIABLE")" != "true" ]; then
+            echo "vars.${BUILD_ENABLED_VARIABLE} is not 'true' on ${ENVIRONMENT}, so nothing is built."
+            ENABLED=false
+          fi
+          if [ "$IS_PRODUCTION" != "true" ] && [ -n "$STAGING_ENABLED_VARIABLE" ] \
+            && [ "$(lookup "$STAGING_ENABLED_VARIABLE")" != "true" ]; then
+            echo "vars.${STAGING_ENABLED_VARIABLE} is not 'true', so this non production branch is not built."
+            ENABLED=false
+          fi
+
+          DEPLOY_ENABLED=true
+          if [ -n "$DEPLOY_ENABLED_VARIABLE" ] && [ "$(lookup "$DEPLOY_ENABLED_VARIABLE")" != "true" ]; then
+            echo "vars.${DEPLOY_ENABLED_VARIABLE} is not 'true' on ${ENVIRONMENT}, so images build but nothing is deployed."
+            DEPLOY_ENABLED=false
+          fi
+
+          DOMAIN_OWNER="$(lookup "$DOMAIN_OWNER_VARIABLE")"
+          if [ -n "$CODEARTIFACT_DOMAIN" ] && [ -z "$DOMAIN_OWNER" ]; then
+            echo "::error::vars.${DOMAIN_OWNER_VARIABLE} is not set on ${ENVIRONMENT}, and codeartifact-domain is."
+            exit 1
+          fi
+
+          echo "Environment: ${ENVIRONMENT} (resource slug ${ENV_SLUG})"
+          {
+            echo "name=${ENVIRONMENT}"
+            echo "env-slug=${ENV_SLUG}"
+            echo "role-arn=${ROLE_TO_ASSUME}"
+            echo "enabled=${ENABLED}"
+            echo "deploy-enabled=${DEPLOY_ENABLED}"
+            echo "domain-owner=${DOMAIN_OWNER}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Credentials are only needed to read the newest published version out of CodeArtifact.
+      # A fresh-dependencies run stamps the run id instead and never makes the call.
+      - name: Configure AWS credentials via OIDC
+        if: >-
+          steps.values.outputs.enabled == 'true'
+          && inputs.fresh-dependencies != true
+          && inputs.dependency-package != ''
+          && inputs.codeartifact-domain != ''
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ steps.values.outputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Resolve the dependency resolution stamp
+        id: stamp
+        if: steps.values.outputs.enabled == 'true'
+        env:
+          FRESH_DEPENDENCIES: ${{ inputs.fresh-dependencies }}
+          RUN_ID: ${{ github.run_id }}
+          DEPENDENCY_PACKAGE: ${{ inputs.dependency-package }}
+          DEPENDENCY_PACKAGE_FORMAT: ${{ inputs.dependency-package-format }}
+          CODEARTIFACT_DOMAIN: ${{ inputs.codeartifact-domain }}
+          CODEARTIFACT_REPOSITORY: ${{ inputs.codeartifact-repository }}
+          CODEARTIFACT_DOMAIN_OWNER: ${{ steps.values.outputs.domain-owner }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPENDENCY_PACKAGE" ]; then
+            echo "No dependency-package, so the dependency layer is not stamped."
+            echo "dependency-stamp=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$FRESH_DEPENDENCIES" = "true" ]; then
+            STAMP="$RUN_ID"
+            echo "fresh-dependencies was requested, so the dependency layer rebuilds."
+          else
+            if [ -z "$CODEARTIFACT_DOMAIN" ] || [ -z "$CODEARTIFACT_REPOSITORY" ]; then
+              echo "::error::dependency-package needs codeartifact-domain and codeartifact-repository."
+              exit 1
+            fi
+            STAMP="$(aws codeartifact list-package-versions \
+              --domain "$CODEARTIFACT_DOMAIN" \
+              --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+              --repository "$CODEARTIFACT_REPOSITORY" \
+              --format "$DEPENDENCY_PACKAGE_FORMAT" \
+              --package "$DEPENDENCY_PACKAGE" \
+              --status Published \
+              --sort-by PUBLISHED_TIME \
+              --query 'versions[0].version' \
+              --output text)"
+            if [ -z "$STAMP" ] || [ "$STAMP" = "None" ]; then
+              echo "::error::No Published ${DEPENDENCY_PACKAGE} version resolved, so the dependency layer cannot be keyed."
+              exit 1
+            fi
+          fi
+          echo "Dependency resolution stamp: ${STAMP}"
+          echo "dependency-stamp=${STAMP}" >> "$GITHUB_OUTPUT"
+
+  affected:
+    name: Resolve the affected domains
+    needs: resolve-env
+    if: needs.resolve-env.outputs.enabled == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      domains: ${{ steps.matrix.outputs.domains }}
+      legs: ${{ steps.matrix.outputs.legs }}
+      any: ${{ steps.affected.outputs.any }}
+      all: ${{ steps.affected.outputs.all }}
+      reason: ${{ steps.affected.outputs.reason }}
+      base: ${{ steps.base.outputs.base }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The base is the head sha of the most recent successful run of this workflow on this
+      # branch. That is a correct floor: a successful run means every domain was either
+      # rebuilt at that sha or was not affected by it, so everything deployed is at least as
+      # new as that commit. A run that failed part way never becomes the base, so the next
+      # run diffs from further back and automatically rebuilds whatever the failed run left
+      # behind. An empty base, and a base that is not an ancestor of head, are both reported
+      # as unknown, which yields every domain. A manual dispatch also yields every domain: it
+      # exists to redeploy, and a dispatch on an already deployed commit would otherwise do
+      # nothing.
+      - name: Resolve the base commit
+        id: base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          FRESH_DEPENDENCIES: ${{ inputs.fresh-dependencies }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_FILE: ${{ inputs.deploy-workflow-file }}
+          DEFAULT_WORKFLOW_FILE: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [ "${FRESH_DEPENDENCIES:-false}" = "true" ]; then
+            echo "fresh-dependencies was requested, so every domain rebuilds."
+            echo "base=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "A manual dispatch redeploys every domain."
+            echo "base=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # github.workflow_ref is owner/repo/.github/workflows/<file>@refs/heads/<branch>,
+          # so the caller's own workflow file is the default without it naming itself.
+          if [ -z "$WORKFLOW_FILE" ]; then
+            WORKFLOW_FILE="${DEFAULT_WORKFLOW_FILE%@*}"
+            WORKFLOW_FILE="${WORKFLOW_FILE##*/}"
+          fi
+          echo "Diff base is the last successful run of ${WORKFLOW_FILE} on ${REF_NAME}."
+
+          CANDIDATES=$(gh api \
+            "repos/${GH_REPO}/actions/workflows/${WORKFLOW_FILE}/runs?branch=${REF_NAME}&status=success&event=push&per_page=20" \
+            --jq '.workflow_runs[].head_sha')
+
+          BASE=""
+          for SHA in $CANDIDATES; do
+            [ "$SHA" = "$GITHUB_SHA" ] && continue
+            if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+              continue
+            fi
+            if git merge-base --is-ancestor "$SHA" "$GITHUB_SHA"; then
+              BASE="$SHA"
+              break
+            fi
+          done
+
+          if [ -z "$BASE" ]; then
+            echo "No successful run on ${REF_NAME} has a head sha that is an ancestor of ${GITHUB_SHA}."
+          else
+            echo "Base: ${BASE}"
+          fi
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Work out the affected domains
+        id: affected
+        uses: WebbPulse/.github/actions/affected-domains@v3
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          base: ${{ steps.base.outputs.base }}
+          head: ${{ github.sha }}
+          mode: deploy
+          unattributed: ${{ inputs.unattributed }}
+          extra-full-paths: ${{ inputs.extra-full-paths }}
+
+      # The action names a domain after its app/domains/ directory, which is a Python package
+      # and so underscored, while every deploy target is hyphenated: the ECR repository, the
+      # Lambda function and the API Gateway route key. The Dockerfile maps the hyphen back
+      # with tr for the DOMAIN build argument.
+      #
+      # The ECR repository is expanded here rather than in the build matrix because GitHub
+      # expressions have no string replace function, so a `{domain}` template cannot be
+      # substituted in a `with:` block. The matrix therefore carries an object per domain and
+      # each leg reads `matrix.leg.repository` directly.
+      - name: Translate the domain names for the matrix
+        id: matrix
+        env:
+          DOMAINS: ${{ steps.affected.outputs.domains }}
+          HYPHENATE: ${{ inputs.hyphenate-domain-names }}
+          ECR_REPOSITORY_TEMPLATE: ${{ inputs.ecr-repository-template }}
+          ENVIRONMENT: ${{ needs.resolve-env.outputs.name }}
+          ENV_SLUG: ${{ needs.resolve-env.outputs.env-slug }}
+        run: |
+          set -euo pipefail
+          OUT=$(printf '%s' "$DOMAINS" | python3 -c '
+          import json, os, sys
+
+          domains = json.load(sys.stdin)
+          if os.environ["HYPHENATE"] == "true":
+              domains = [d.replace("_", "-") for d in domains]
+
+          template = os.environ["ECR_REPOSITORY_TEMPLATE"]
+          environment = os.environ["ENVIRONMENT"]
+          env_slug = os.environ["ENV_SLUG"]
+
+          legs = [
+              {
+                  "domain": domain,
+                  "repository": (
+                      template.replace("{environment}", environment)
+                      .replace("{env-slug}", env_slug)
+                      .replace("{domain}", domain)
+                  ),
+              }
+              for domain in domains
+          ]
+          print(json.dumps(domains))
+          print(json.dumps(legs))
+          ')
+          MATRIX=$(printf '%s' "$OUT" | head -n 1)
+          LEGS=$(printf '%s' "$OUT" | tail -n 1)
+          echo "Matrix domains: ${MATRIX}"
+          echo "domains=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "legs=${LEGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Write the verdict to the summary
+        env:
+          REASON: ${{ steps.affected.outputs.reason }}
+          DOMAINS: ${{ steps.matrix.outputs.domains }}
+          BASE: ${{ steps.base.outputs.base }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Deploy scope"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| base | \`${BASE:-none, so every domain}\` |"
+            echo "| head | \`${GITHUB_SHA}\` |"
+            echo "| domains | \`${DOMAINS}\` |"
+            echo
+            echo "${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  warm-base-image:
+    name: Warm the base image cache
+    needs: [resolve-env, affected]
+    if: needs.affected.outputs.any == 'true' && inputs.warm-base-image
+    permissions:
+      contents: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/base-image-cache.yml@v3
+    with:
+      environment: ${{ needs.resolve-env.outputs.name }}
+      aws-region: ${{ inputs.aws-region }}
+      dockerfile: ${{ inputs.dockerfile }}
+      platform: ${{ inputs.platform }}
+      additional-ecr-registries: ${{ inputs.additional-ecr-registries }}
+      runs-on: ${{ inputs.runs-on }}
+    secrets:
+      role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
+
+  build-images:
+    name: Build and push domain images
+    needs: [resolve-env, affected, warm-base-image]
+    # always() so a skipped warm up, which is a legitimate configuration rather than a
+    # failure, does not skip the matrix with it.
+    if: >-
+      always()
+      && needs.affected.outputs.any == 'true'
+      && needs.resolve-env.result == 'success'
+      && needs.affected.result == 'success'
+      && needs.warm-base-image.result != 'failure'
+      && needs.warm-base-image.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.affected.outputs.legs) }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/container-image.yml@v3
+    with:
+      environment: ${{ needs.resolve-env.outputs.name }}
+      ecr-repository: ${{ matrix.leg.repository }}
+      aws-region: ${{ inputs.aws-region }}
+      context: ${{ inputs.build-context }}
+      dockerfile: ${{ inputs.dockerfile }}
+      platform: ${{ inputs.platform }}
+      build-args: |
+        DOMAIN=${{ matrix.leg.domain }}
+        ${{ inputs.dependency-package != '' && format('DEPENDENCY_RESOLUTION={0}', needs.resolve-env.outputs.dependency-stamp) || '' }}
+      codeartifact-domain: ${{ inputs.codeartifact-domain }}
+      codeartifact-domain-owner: ${{ needs.resolve-env.outputs.domain-owner }}
+      codeartifact-repository: ${{ inputs.codeartifact-repository }}
+      additional-ecr-registries: ${{ inputs.additional-ecr-registries }}
+      image-tag-suffix: ${{ inputs.fresh-dependencies && format('deps-{0}', github.run_id) || '' }}
+      skip-if-tag-exists: ${{ inputs.skip-if-tag-exists }}
+      upload-manifest-artifact: true
+      runs-on: ${{ inputs.runs-on }}
+    secrets:
+      role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
+
+  image-map:
+    name: Assemble the function image map
+    needs: [resolve-env, affected, build-images]
+    if: always() && needs.affected.outputs.any == 'true' && needs.build-images.result != 'skipped'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    outputs:
+      function-image-map: ${{ steps.map.outputs.function-image-map }}
+    steps:
+      # A matrix of reusable workflow calls collapses to one `needs` entry whose outputs hold
+      # whichever leg finished last, and a job with `uses:` cannot carry `steps:` to capture
+      # them. Each leg therefore uploads a one file manifest and this job collects them all.
+      - name: Download the per-domain image manifests
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: manifests
+          pattern: image-*
+          merge-multiple: true
+
+      - name: Assemble the function image map
+        id: map
+        env:
+          ENVIRONMENT: ${{ needs.resolve-env.outputs.name }}
+          ENV_SLUG: ${{ needs.resolve-env.outputs.env-slug }}
+          DOMAINS: ${{ needs.affected.outputs.domains }}
+          FUNCTION_NAME_TEMPLATE: ${{ inputs.function-name-template }}
+          CONSUMERS_JSON: ${{ inputs.consumers-json }}
+        run: |
+          set -euo pipefail
+          mkdir -p manifests
+          python3 - <<'PY' > function-image-map.json
+          import json, os, pathlib
+
+          template = os.environ["FUNCTION_NAME_TEMPLATE"]
+          environment = os.environ["ENVIRONMENT"]
+          env_slug = os.environ["ENV_SLUG"]
+
+
+          def function_name(domain: str) -> str:
+              """Expand the caller's function name template for one domain or consumer."""
+              return (
+                  template.replace("{environment}", environment)
+                  .replace("{env-slug}", env_slug)
+                  .replace("{domain}", domain)
+              )
+
+
+          # Each consumer runs the image of the domain it belongs to, under a different
+          # entrypoint command set in the product's infrastructure. A consumer is only ever
+          # added when that domain was rebuilt in this run, so on a partial deploy a consumer
+          # whose domain did not change keeps the image it is already on.
+          consumers = json.loads(os.environ["CONSUMERS_JSON"])
+
+          out = {}
+          built = set()
+          expected = set(json.loads(os.environ["DOMAINS"]))
+          for path in sorted(pathlib.Path("manifests").glob("*.json")):
+              manifest = json.loads(path.read_text())
+              domain = manifest["repository"].rsplit("/", 1)[-1]
+              built.add(domain)
+              out[function_name(domain)] = manifest["image_uri"]
+              for consumer in consumers.get(domain, []):
+                  out[function_name(consumer)] = manifest["image_uri"]
+
+          missing = sorted(expected - built)
+          if missing:
+              raise SystemExit(f"No image manifest for affected domain(s): {', '.join(missing)}")
+
+          print(json.dumps(out, indent=2))
+          PY
+          cat function-image-map.json
+
+          MAP=$(python3 -c 'import json; print(json.dumps(json.load(open("function-image-map.json"))))')
+          echo "function-image-map=${MAP}" >> "$GITHUB_OUTPUT"
+
+          TAGS=$(python3 -c '
+          import json, pathlib
+
+          tags = sorted({json.loads(p.read_text())["tag"] for p in pathlib.Path("manifests").glob("*.json")})
+          print(", ".join(tags) if tags else "none")
+          ')
+          echo "image-tag=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Write the image map to the summary
+        env:
+          RESULT: ${{ needs.build-images.result }}
+          IMAGE_TAG: ${{ steps.map.outputs.image-tag }}
+          DOMAINS: ${{ needs.affected.outputs.domains }}
+          REASON: ${{ needs.affected.outputs.reason }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Domain images"
+            echo
+            echo "Matrix result: \`${RESULT}\`. Tag: \`${IMAGE_TAG}\`."
+            echo
+            echo "Affected domains: \`${DOMAINS}\`. ${REASON}"
+            echo
+            echo "The map passed to \`lambda-image-deploy.yml\` as"
+            echo "\`function-image-map\`, filtered to the functions that exist."
+            echo "Every value is pinned by digest, not by tag."
+            echo
+            echo '```json'
+            cat function-image-map.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the function image map
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: function-image-map
+          path: function-image-map.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  existing-functions:
+    name: Drop the functions that do not exist yet
+    needs: [resolve-env, image-map]
+    if: >-
+      always()
+      && needs.image-map.result == 'success'
+      && needs.resolve-env.outputs.deploy-enabled == 'true'
+      && needs.image-map.outputs.function-image-map != ''
+      && needs.image-map.outputs.function-image-map != '{}'
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ needs.resolve-env.outputs.name }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      function-image-map: ${{ steps.filter.outputs.function-image-map }}
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Drop the functions that do not exist yet
+        id: filter
+        env:
+          FUNCTION_IMAGE_MAP: ${{ needs.image-map.outputs.function-image-map }}
+          BOOTSTRAP_NOTE: ${{ inputs.bootstrap-note }}
+        run: |
+          set -euo pipefail
+
+          FUNCTIONS=$(printf '%s' "$FUNCTION_IMAGE_MAP" \
+            | python3 -c 'import json,sys; print("\n".join(sorted(json.load(sys.stdin))))')
+
+          PRESENT=""
+          MISSING=""
+          while IFS= read -r FUNCTION; do
+            [ -n "$FUNCTION" ] || continue
+            set +e
+            ERR=$(aws lambda get-function-configuration \
+              --function-name "$FUNCTION" \
+              --query 'FunctionName' --output text 2>&1 >/dev/null)
+            STATUS=$?
+            set -e
+
+            if [ "$STATUS" -eq 0 ]; then
+              PRESENT="${PRESENT}${FUNCTION}\n"
+              continue
+            fi
+
+            case "$ERR" in
+              *ResourceNotFoundException*|*"Function not found"*)
+                MISSING="${MISSING}${FUNCTION}\n"
+                ;;
+              *)
+                echo "$ERR"
+                echo "::error::get-function-configuration failed for ${FUNCTION} for a reason other than the function not existing."
+                exit 1
+                ;;
+            esac
+          done <<< "$FUNCTIONS"
+
+          printf '%s' "$FUNCTION_IMAGE_MAP" \
+            | PRESENT="$(printf "%b" "$PRESENT")" python3 -c '
+          import json, os, sys
+
+          full = json.load(sys.stdin)
+          present = {n for n in os.environ["PRESENT"].split("\n") if n}
+          json.dump({k: v for k, v in full.items() if k in present}, open("deploy-map.json", "w"), indent=2)
+          '
+
+          MAP=$(python3 -c 'import json; print(json.dumps(json.load(open("deploy-map.json"))))')
+          echo "function-image-map=${MAP}" >> "$GITHUB_OUTPUT"
+
+          # shellcheck disable=SC2016 # the $/ in the sed scripts below is an end anchor,
+          # not a shell expansion, so the single quotes are deliberate.
+          {
+            echo "## Deploy targets"
+            echo
+            if [ -n "$PRESENT" ]; then
+              echo "Deploying:"
+              echo
+              printf "%b" "$PRESENT" | sed 's/^/- `/; s/$/`/'
+            else
+              echo "No domain function exists yet, so nothing is deployed. The images"
+              echo "are built and pushed. ${BOOTSTRAP_NOTE}"
+            fi
+            if [ -n "$MISSING" ]; then
+              echo
+              echo "Not created yet, skipped:"
+              echo
+              printf "%b" "$MISSING" | sed 's/^/- `/; s/$/`/'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-images:
+    name: Point each function at its new image
+    needs: [resolve-env, existing-functions]
+    if: >-
+      needs.existing-functions.result == 'success'
+      && needs.existing-functions.outputs.function-image-map != ''
+      && needs.existing-functions.outputs.function-image-map != '{}'
+    permissions:
+      contents: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v3
+    with:
+      environment: ${{ needs.resolve-env.outputs.name }}
+      aws-region: ${{ inputs.aws-region }}
+      function-image-map: ${{ needs.existing-functions.outputs.function-image-map }}
+      publish-version: ${{ inputs.publish-version }}
+      concurrency-group: ${{ inputs.concurrency-group != '' && inputs.concurrency-group || format('backend-image-deploy-{0}', needs.resolve-env.outputs.name) }}
+      runs-on: ${{ inputs.runs-on }}
+    secrets:
+      role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
+
+  smoke-domains:
+    name: Smoke test each domain function
+    needs: [resolve-env, existing-functions, deploy-images]
+    if: needs.deploy-images.result == 'success' && inputs.run-smoke
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ needs.resolve-env.outputs.name }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Probe each deployed domain function
+        env:
+          FUNCTION_IMAGE_MAP: ${{ needs.existing-functions.outputs.function-image-map }}
+          SMOKE_EXCLUDE_SUFFIX: ${{ inputs.smoke-exclude-suffix }}
+          SMOKE_USER_AGENT: ${{ inputs.smoke-user-agent != '' && inputs.smoke-user-agent || format('{0}-deploy-smoke', github.event.repository.name) }}
+        run: |
+          set -euo pipefail
+
+          USER_AGENT="$SMOKE_USER_AGENT" python3 - <<'PY' > event.json
+          import json, os
+
+          agent = os.environ["USER_AGENT"]
+          print(json.dumps({
+              "version": "2.0",
+              "routeKey": "GET /health",
+              "rawPath": "/health",
+              "rawQueryString": "",
+              "headers": {
+                  "accept": "application/json",
+                  "host": "smoke.invoke.local",
+                  "user-agent": agent,
+              },
+              "requestContext": {
+                  "accountId": "anonymous",
+                  "apiId": "smoke",
+                  "domainName": "smoke.invoke.local",
+                  "http": {
+                      "method": "GET",
+                      "path": "/health",
+                      "protocol": "HTTP/1.1",
+                      "sourceIp": "127.0.0.1",
+                      "userAgent": agent,
+                  },
+                  "requestId": "smoke",
+                  "routeKey": "GET /health",
+                  "stage": "$default",
+                  "time": "01/Jan/2026:00:00:00 +0000",
+                  "timeEpoch": 1767225600000,
+              },
+              "isBase64Encoded": False,
+          }, indent=2))
+          PY
+
+          FUNCTIONS=$(printf '%s' "$FUNCTION_IMAGE_MAP" | python3 -c '
+          import json, os, sys
+
+          suffix = os.environ["SMOKE_EXCLUDE_SUFFIX"]
+          names = sorted(json.load(sys.stdin))
+          if suffix:
+              names = [n for n in names if not n.endswith(suffix)]
+          print("\n".join(names))
+          ')
+
+          FAILED=0
+          while IFS= read -r FUNCTION; do
+            [ -n "$FUNCTION" ] || continue
+            echo "::group::${FUNCTION} GET /health"
+
+            META=$(aws lambda invoke \
+              --function-name "$FUNCTION" \
+              --cli-binary-format raw-in-base64-out \
+              --payload file://event.json \
+              --cli-read-timeout 60 \
+              response.json)
+            echo "$META"
+
+            STATUS=$(python3 -c '
+          import json, sys
+
+          try:
+              payload = json.load(open("response.json"))
+          except (OSError, ValueError):
+              print("unparseable")
+              sys.exit(0)
+          print(payload.get("statusCode", "missing") if isinstance(payload, dict) else "not-an-object")
+          ')
+
+            if [ "$STATUS" = "200" ]; then
+              echo "${FUNCTION} answered GET /health with 200."
+            else
+              echo "${FUNCTION} answered GET /health with ${STATUS}, expected 200."
+              echo "Response payload:"
+              cat response.json
+              echo
+              FAILED=1
+            fi
+            echo "::endgroup::"
+          done <<< "$FUNCTIONS"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::One or more domain functions failed the /health probe."
+            exit 1
+          fi
+          echo "Every deployed domain function answered GET /health with 200."
+          if [ -n "$SMOKE_EXCLUDE_SUFFIX" ]; then
+            echo "Functions ending ${SMOKE_EXCLUDE_SUFFIX} are excluded: no API Gateway route to probe."
+          fi

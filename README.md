@@ -37,6 +37,9 @@ One line each, pointing at the section that documents the inputs, secrets and be
 - [`lambda-image-deploy.yml`](.github/workflows/README.md#lambda-image-deployyml) points
   one or many Lambda functions at an image URI concurrently, waiting for each function
   to settle either side of the update.
+- [`lambda-domains-deploy.yml`](.github/workflows/README.md#lambda-domains-deployyml) is
+  the whole backend deploy for a repository that ships one image per domain onto one
+  Lambda function per domain, composing the three workflows above.
 - [`spa-deploy.yml`](.github/workflows/README.md#spa-deployyml) builds a frontend, syncs
   it to S3 in three ordered passes so the site is never briefly broken, and invalidates
   CloudFront.
