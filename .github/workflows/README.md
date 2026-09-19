@@ -741,6 +741,11 @@ Two GitHub rules shape the design and are worth knowing before changing it:
   hold whichever leg finished last. The build legs therefore each upload a one file
   manifest and `image-map` collects them, exactly as `container-image.yml` documents.
 
+**The inner calls pin `@v3`, not the caller's ref.** A product that pins this workflow to an
+exact `v3.x.y` still runs the three composed workflows at whatever `v3` points to, because a
+reusable workflow names its own dependencies. Moving the `v3` tag therefore changes what an
+exactly pinned caller runs one level down.
+
 **Secrets do not propagate through nesting.** In the chain caller to this workflow to
 `container-image.yml`, a secret reaches the innermost workflow only because it is passed
 at each hop. This workflow takes no `secrets:` at all: the deploy role ARN is read from
