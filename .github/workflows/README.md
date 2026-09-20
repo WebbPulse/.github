@@ -973,8 +973,7 @@ jobs:
       dependency-package: webbpulse
       codeartifact-domain: webbpulse
       codeartifact-repository: python
-      additional-ecr-registries: ${{ vars.ARTIFACTS_ACCOUNT_ID }}
-      concurrency-group: backend-image-deploy-${{ github.ref_name }}
+      additional-ecr-registries: "432410731887"
       bootstrap-note: >-
         Row 13 of the split plan creates the first function and the next run
         deploys it.
@@ -1005,7 +1004,7 @@ jobs:
       dependency-package: webbpulse
       codeartifact-domain: webbpulse
       codeartifact-repository: python
-      additional-ecr-registries: ${{ vars.ARTIFACTS_ACCOUNT_ID }}
+      additional-ecr-registries: "432410731887"
       extra-full-paths: |
         .github/workflows/deploy-backend.yml
       consumers-json: >-
@@ -1039,7 +1038,7 @@ jobs:
       dependency-package: webbpulse
       codeartifact-domain: webbpulse
       codeartifact-repository: python
-      additional-ecr-registries: ${{ vars.ARTIFACTS_ACCOUNT_ID }}
+      additional-ecr-registries: "432410731887"
       concurrency-group: backend-deploy-${{ github.ref_name }}
       bootstrap-note: >-
         The first apply with a non-empty bootstrap_image_tag creates the
