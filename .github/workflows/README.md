@@ -1732,7 +1732,7 @@ contains an `entrypoint.py`, which is the same thing the image build means by `D
 | --- | --- |
 | Anything matching `extra-full-paths` | every domain |
 | `<wd>/` outside `app/`, `tests/`, `e2e/`, `scripts/`, `docs/` and `README*` | every domain, since the Dockerfile, `pyproject.toml`, `uv.lock` and runtime files rebuild every image |
-| `<wd>/app/domains/<name>/**` | that domain |
+| `<wd>/app/domains/<name>/**` | that domain, plus every other domain whose entrypoint closure reaches the file |
 | `<wd>/app/common/**.py` | every domain whose entrypoint closure reaches the file |
 | `<wd>/app/common/**` non Python | every domain, because the walk cannot follow a data file |
 | Other `<wd>/app/**`, for example `app/main.py` | per `unattributed` |
@@ -1752,9 +1752,11 @@ and attributes a lazy `app.domains.<name>` import made from outside any domain t
 alone. That last rule is the per-domain router loader, and it is the property that lets one
 `app/` tree ship as several single-domain images.
 
-The walk is the same one the product repositories assert in their own reachability test, so
-a domain that starts reaching another domain fails that test rather than silently widening a
-deploy here.
+The closure also decides cross-domain imports. A file under `app/domains/<name>/` always
+belongs to `<name>`, and it additionally belongs to every other domain whose entrypoint
+closure reaches it, so a fix to a module one domain imports from another deploys both
+functions instead of leaving the importer on stale code. A file no closure reaches, such as
+a test helper, stays with `<name>` alone.
 
 ### Modules loaded by name
 
