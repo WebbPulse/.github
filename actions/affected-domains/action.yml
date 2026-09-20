@@ -2,8 +2,9 @@ name: Affected domains
 description: >-
   Works out which backend domains a diff actually affects, so CI shards and deploys
   run only for the domains whose code changed. A file under a domain belongs to that
-  domain, a file under app/common belongs to every domain whose entrypoint import
-  closure reaches it, and anything that rebuilds every image yields all of them.
+  domain plus every other domain whose entrypoint import closure reaches it, a file
+  under app/common belongs to every domain whose entrypoint import closure reaches
+  it, and anything that rebuilds every image yields all of them.
   A base that cannot be resolved is reported as unknown, which yields all domains.
 
 inputs:

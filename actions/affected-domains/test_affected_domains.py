@@ -102,15 +102,25 @@ def repo(tmp_path):
         "from app.domains.alpha import router\n",
     )
     write(root, "backend/app/domains/alpha/router.py", "ROUTES = []\n")
+    write(root, "backend/app/domains/alpha/service.py", "def serve():\n    return 1\n")
+    write(root, "backend/app/domains/alpha/helpers.py", "HELPER = True\n")
+    write(root, "backend/app/domains/alpha/late.py", "LATE = True\n")
 
     write(root, "backend/app/domains/beta/__init__.py", "")
     write(
         root,
         "backend/app/domains/beta/entrypoint.py",
         "from app.common.composition import wiring\n"
+        "from app.domains.alpha import service\n"
+        "from app.domains.beta import loader\n"
         "from app.domains.beta import router\n",
     )
     write(root, "backend/app/domains/beta/router.py", "ROUTES = []\n")
+    write(
+        root,
+        "backend/app/domains/beta/loader.py",
+        "def load():\n    from app.domains.alpha import late\n\n    return late\n",
+    )
 
     write(root, "backend/tests/test_top.py", "def test_top():\n    assert True\n")
     write(root, "backend/tests/common/test_common.py", "def test_common():\n    assert True\n")
@@ -196,6 +206,46 @@ def test_a_domain_change_affects_only_that_domain(repo):
     assert json.loads(result["domains"]) == ["alpha"]
     assert result["all"] == "false"
     assert result["any"] == "true"
+
+
+def test_a_domain_module_another_domain_imports_is_attributed_to_both(repo):
+    """Beta's entrypoint imports alpha's service, so a fix there has to deploy both."""
+    base, head = commit(
+        repo, {"backend/app/domains/alpha/service.py": "def serve():\n    return 2\n"}
+    )
+    result = run(repo, base, head, mode="deploy")
+    assert json.loads(result["domains"]) == ["alpha", "beta"]
+    assert result["all"] == "true"
+
+
+def test_a_domain_module_nobody_imports_stays_with_its_own_domain(repo):
+    """An unimported helper is alpha's alone, so a fan-out here would be noise."""
+    base, head = commit(repo, {"backend/app/domains/alpha/helpers.py": "HELPER = False\n"})
+    result = run(repo, base, head, mode="deploy")
+    assert json.loads(result["domains"]) == ["alpha"]
+    assert result["all"] == "false"
+
+
+def test_a_lazily_imported_cross_domain_module_follows_the_lazy_rules(repo):
+    """Beta reaches alpha's `late` through a function body import inside its own tree."""
+    base, head = commit(repo, {"backend/app/domains/alpha/late.py": "LATE = False\n"})
+    result = run(repo, base, head, mode="deploy")
+    assert json.loads(result["domains"]) == ["alpha", "beta"]
+
+
+def test_a_domain_module_a_router_loader_reaches_stays_with_its_own_domain(repo):
+    """A lazy `app.domains.<name>` import from shared wiring is still that domain's alone."""
+    write(
+        repo,
+        "backend/app/domains/alpha/router.py",
+        "from app.domains.alpha import helpers\n\nROUTES = []\n",
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "router")
+
+    base, head = commit(repo, {"backend/app/domains/alpha/helpers.py": "HELPER = 1\n"})
+    result = run(repo, base, head, mode="deploy")
+    assert json.loads(result["domains"]) == ["alpha"]
 
 
 def test_a_common_file_reaches_only_the_domains_that_import_it(repo):

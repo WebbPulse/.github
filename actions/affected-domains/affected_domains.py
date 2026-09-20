@@ -2,9 +2,10 @@
 
 A domain is an immediate subdirectory of `app/domains/` holding an `entrypoint.py`.
 Every changed path is attributed to the domains it can reach: a file under a
-domain belongs to that domain, a file under `app/common/` belongs to every domain
-whose entrypoint import closure contains it, and anything that rebuilds every
-image belongs to all of them. The result drives which CI shards and which deploys
+domain belongs to that domain plus every other domain whose entrypoint import
+closure reaches it, a file under `app/common/` belongs to every domain whose
+entrypoint import closure contains it, and anything that rebuilds every image
+belongs to all of them. The result drives which CI shards and which deploys
 actually run.
 
 The walk is static, so it holds for the image that ships without importing
@@ -373,7 +374,11 @@ def attribute(paths, *, work_dir_rel, mode, unattributed, extra_full_paths, doma
             rest = path[len(domains_prefix) + 1 :].split("/")
             shared = True
             if len(rest) >= 2 and rest[0] in all_domains:
-                attribution[path] = ("domain", {rest[0]})
+                owners = _domain_file_owners(
+                    work_dir / relative, rest[0], domains, closures, name_owners
+                )
+                label = "domain" if owners == {rest[0]} else "domain-imported"
+                attribution[path] = (label, owners)
             elif len(rest) >= 2:
                 attribution[path] = ("not-a-domain", set())
             else:
@@ -424,6 +429,23 @@ def attribute(paths, *, work_dir_rel, mode, unattributed, extra_full_paths, doma
         shared = False
 
     return attribution, forced, shared
+
+
+def _domain_file_owners(absolute, owning_domain, domains, closures, name_owners):
+    """Domains a file under `app/domains/<owning_domain>/` affects.
+
+    Its own domain always owns it, so a test helper or any other module no closure
+    reaches stays with that domain alone. Every other domain whose entrypoint
+    closure reaches the file is added, which is what makes a cross-domain import
+    deploy both functions, and a file claimed by the `loaded-by-name` globs takes
+    that rule's owners on top.
+    """
+    owners = {owning_domain}
+    by_name = name_owners.get(absolute)
+    if by_name is not None:
+        owners |= set(by_name)
+    owners |= {domain for domain in domains if absolute in closures[domain]}
+    return owners
 
 
 def _unattributed(policy, all_domains):
