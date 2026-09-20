@@ -207,6 +207,32 @@ jobs:
       MODE: full
       JUNIT_PATH: ${{ inputs.working-directory }}/e2e-results.xml
     steps:
+      - name: Forward the Environment's E2E_ variables
+        env:
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import uuid
+
+          values = json.loads(os.environ["VARS_JSON"] or "{}")
+          forwarded = []
+          skipped = []
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key in sorted(values):
+                  if not key.startswith("E2E_"):
+                      continue
+                  if os.environ.get(key):
+                      skipped.append(key)
+                      continue
+                  delimiter = f"ghadelim_{uuid.uuid4().hex}"
+                  handle.write(f"{key}<<{delimiter}\n{values[key]}\n{delimiter}\n")
+                  forwarded.append(key)
+          print("Forwarded: " + (", ".join(forwarded) or "(none)"))
+          print("Already resolved by the workflow, left alone: " + (", ".join(skipped) or "(none)"))
+          PY
+
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

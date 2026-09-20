@@ -1381,6 +1381,14 @@ missing variable fails in seconds rather than midway through the suite.
 a value the convention does not cover, passes it with `with:` and that wins. The inputs are
 unchanged, so a caller written against the earlier tag keeps working.
 
+**Every `E2E_` variable is forwarded, not just the table.** The table lists the names this
+workflow resolves itself. Before anything else runs, a step reads the calling repository's
+Environment variables and exports every name beginning with `E2E_` to the suite, so a product
+that needs a value this workflow has never heard of, `E2E_RUN_ROLE_ARN` for example, sets it
+as an Environment variable and the plugin reads it. A name the workflow already resolved from
+an input or a secret is left alone, so explicit inputs still win and `E2E_USER_PASSWORD`
+remains an Environment secret. Adding a new `E2E_` name needs no change here and no new tag.
+
 **Branch protection.** `e2e (staging)` is the required check for the release pull request into
 `main`. Add it, or whatever `check-name` resolves to on staging, to the required status checks
 on `main` in the product's ruleset. The staging deploy publishes that check on the commit it
@@ -1490,6 +1498,11 @@ Outputs: none. The result is the check run.
 selects the local behaviour in the plugin. `E2E_USER_EMAIL` and `E2E_USER_PASSWORD` come from
 `backend-env-json`, pointing at a user the product's own seed creates locally, not at the
 durable staging user.
+
+Alongside those, a first step forwards every `E2E_` variable visible to the job, skipping any
+name this workflow already set itself. This job runs in no GitHub Environment, so the names it
+sees are the calling repository's and organisation's variables. A product needing an extra
+`E2E_` value sets the variable and no change is needed here.
 
 ### The caller
 
