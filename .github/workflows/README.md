@@ -1317,9 +1317,18 @@ once, and cancelling the earlier one would leave its check run unpublished.
 Two GitHub rules shape the caller. A `workflow_run` or `workflow_dispatch` workflow only exists
 once its file is on the default branch, so a caller merged to `staging` alone never fires; land
 the identical file on `main` first. And a `workflow_run` run always executes on the default
-branch, so the `staging` GitHub Environment's deployment branch policy must allow `main` as well
-as `staging`, otherwise the e2e job is rejected before its first step with "Branch main is not
-allowed to deploy to staging".
+branch, so the `staging` GitHub Environment's deployment branch policy must allow the default
+branch as well as `staging`.
+
+The symptom of the missing policy entry is a staging suite that fails in about a second, before
+its first step, with "Branch main is not allowed to deploy to staging due to environment
+protection rules", and no `e2e (staging)` check run is ever published, so the release pull
+request waits on a check that cannot arrive. Add the default branch to the policy once per
+repository:
+
+```bash
+gh api repos/<owner>/<repo>/environments/staging/deployment-branch-policies -f name=main -f type=branch
+```
 
 ### The gate
 
@@ -2043,6 +2052,16 @@ What a caller repository has to provide before these workflows will run.
 
 - An Environment per stage (`staging`, `production`) holding the `vars` the snippets
   above read, and the deploy role ARN as an Environment secret.
+- A `staging` Environment whose deployment branch policy, when it is restricted at all,
+  allows the default branch as well as `staging`, because the `workflow_run` caller of
+  `e2e.yml` executes from the default branch. Without it the staging suite is rejected in
+  about a second with "Branch main is not allowed to deploy to staging due to environment
+  protection rules" and no `e2e (staging)` check is published. See
+  [`e2e.yml`](#the-caller).
+
+  ```bash
+  gh api repos/<owner>/<repo>/environments/staging/deployment-branch-policies -f name=main -f type=branch
+  ```
 - Nothing estate specific committed to this repository. Bucket names, distribution
   ids, function names, ECR repositories and regions live in caller `vars`.
 
