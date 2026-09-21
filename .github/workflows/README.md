@@ -1869,6 +1869,145 @@ jobs:
 
 ---
 
+## `check-runs-gate.yml`
+
+Answers one question, **are the checks on this exact commit actually green**, in a way
+that the three ways we have been fooled in production cannot fool again. It polls the
+check runs API for a sha the caller supplies, classifies every conclusion, and writes a
+step summary listing each check it counted so a human can see the reasoning without
+re-querying the API.
+
+This exists because gating code that reasons about checks informally keeps reaching the
+wrong verdict. The rule below is the standard, so callers do not each invent one.
+
+### The three failure modes it defends against
+
+**1. A cancelled run is not a failure, and it is not a pass.** Every CI workflow here sets
+`cancel-in-progress: true`, so a second push seconds after the first silently cancels the
+first run. A cancelled check looks red at a glance and gets read as a real failure, and
+someone goes hunting for a bug that does not exist. It is neither verdict: the run never
+finished, so it says nothing about the commit. The gate reports `cancelled` for any of
+`cancelled`, `timed_out`, `stale` or `action_required`, and the message says in words that
+the run needs re-running rather than debugging.
+
+**2. Zero check runs on a sha is the dangerous case.** GitHub sometimes drops the
+`pull_request` event outright: `mergeable` stays `UNKNOWN` and no run is ever queued. Code
+that filters the check list for failures finds none, concludes green and merges something
+nothing ever built. Silence is not success. `require-minimum`, 1 by default, makes an empty
+list a loud `missing` failure instead of a quiet pass.
+
+**3. Checks on an older sha are not checks on this one.** Asking for "the pull request's
+checks" aggregates across heads, so a green answer can come from a commit two pushes ago.
+`sha` is required and has no default for that reason. Always pass the head sha you actually
+mean, which on a `pull_request` event is `github.event.pull_request.head.sha` and not
+`github.sha`, the merge commit nobody is looking at.
+
+### Empty is ambiguous, so the gate disambiguates
+
+Zero check runs does not always mean a dropped event. A docs only pull request can
+legitimately have zero, because path filters correctly skipped every workflow. Those are
+opposite conditions with identical check lists, so the gate asks a second question the
+check runs API cannot answer: does the Actions API show any workflow runs for this sha?
+
+| Check runs | Workflow runs | Verdict | Reading |
+| --- | --- | --- | --- |
+| below minimum | more than zero | `missing` | Workflows ran and produced no check runs. Genuinely anomalous. |
+| below minimum | zero | `missing` | Nothing was triggered. Dropped event **or** correct path filtering, and the gate says so rather than guessing. |
+| below minimum | zero, `allow-no-checks: true` | `success` | The caller declared beforehand that a change triggering nothing is expected here. |
+
+`allow-no-checks` only applies when there are no workflow runs at all. Runs that produce no
+check runs stay a failure whatever the flag says. Set it on a docs only path deliberately,
+so the opt in is a decision in the caller rather than the gate silently forgiving silence.
+The step summary always prints both counts, so whoever reads the run can see which row of
+that table they landed in.
+
+### A green third-party status is not evidence
+
+This gate counts check runs and workflow runs, which are things that actually executed. Some
+third-party integrations post a status that goes green without any run ever being queued.
+The HCP Terraform status on a pull request does exactly this, passing within seconds without
+creating a configuration version. Treat a status of that kind as unverified. It is not a
+substitute for this gate, and a repository that relies on one is back in failure mode 2 with
+a green tick on top.
+
+### The reading rule
+
+| Conclusion | Counted as |
+| --- | --- |
+| `success`, `skipped`, `neutral` | passing |
+| `failure` | real failure, output `failed` |
+| `cancelled`, `timed_out`, `stale`, `action_required` | no verdict, output `cancelled`, re-run needed |
+| anything unrecognised | `failed`, because an unknown conclusion is never assumed to be a pass |
+
+A real `failure` outranks a no verdict, so a commit with one failed check and one cancelled
+check reports `failed`. Checks still pending when `timeout-minutes` expires report `timeout`.
+Every non `success` verdict fails the job, so a caller can simply depend on it, and the
+`conclusion` output is there for a caller that wants to branch on which kind it was.
+
+### Waiting on itself
+
+If the gate runs inside a workflow that itself publishes a check run on the same sha, that
+check run is `in_progress` for as long as the gate is polling, so the gate would wait for
+itself until it timed out. Put those names in `ignore-checks`, newline or comma separated.
+Ignored names are excluded from the count as well as the verdict, which is why
+`require-minimum` counts non ignored checks only.
+
+### Inputs
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `sha` | string | required | The commit to gate on. Never a branch or a pull request number. |
+| `repository` | string | `${{ github.repository }}` | As `owner/repo`. |
+| `timeout-minutes` | number | `30` | How long pending checks may take to settle. |
+| `poll-seconds` | number | `30` | Interval between polls. |
+| `ignore-checks` | string | `""` | Check run names to exclude, newline or comma separated. |
+| `require-minimum` | number | `1` | Fewest non ignored check runs that count as verified. |
+| `allow-no-checks` | boolean | `false` | Pass when nothing at all was triggered. Opt in per caller. |
+| `runs-on` | string | `ubuntu-latest` | Runner label. |
+
+| Output | Values |
+| --- | --- |
+| `conclusion` | `success`, `failed`, `cancelled`, `missing`, `timeout` |
+| `summary` | One human readable line describing the verdict. |
+
+The calling job needs `checks: read` to read the check runs and `actions: read` for the
+workflow runs query that disambiguates an empty list.
+
+```yaml
+jobs:
+  verify:
+    permissions:
+      checks: read
+      contents: read
+      actions: read
+    uses: WebbPulse/.github/.github/workflows/check-runs-gate.yml@v3
+    with:
+      sha: ${{ github.event.pull_request.head.sha }}
+      ignore-checks: |
+        verify
+      timeout-minutes: 20
+```
+
+Branching on the kind of verdict, for a caller that wants to retry a no verdict rather than
+report it:
+
+```yaml
+  react:
+    needs: [verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report
+        env:
+          CONCLUSION: ${{ needs.verify.outputs.conclusion }}
+          SUMMARY: ${{ needs.verify.outputs.summary }}
+        run: |
+          set -euo pipefail
+          echo "${CONCLUSION}: ${SUMMARY}"
+```
+
+---
+
 ## Merging: auto-merge on green
 
 Every repository in the organisation has `allow_auto_merge` and `delete_branch_on_merge`
