@@ -1,0 +1,253 @@
+name: Check Runs Gate
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: >-
+          Commit sha to gate on. Always an explicit sha, never a branch or a pull request
+          number, so the verdict can never come from checks that belong to an older head.
+        type: string
+        required: true
+      repository:
+        description: "Repository holding the commit, as owner/repo."
+        type: string
+        required: false
+        default: ${{ github.repository }}
+      timeout-minutes:
+        description: "How long to wait for pending check runs to settle before giving up."
+        type: number
+        required: false
+        default: 30
+      poll-seconds:
+        description: "Seconds between polls of the check runs API."
+        type: number
+        required: false
+        default: 30
+      ignore-checks:
+        description: >-
+          Check run names to exclude, separated by newlines or commas. The usual reason is
+          that the gate runs inside a workflow whose own check run would otherwise never
+          settle, so the gate would wait on itself.
+        type: string
+        required: false
+        default: ""
+      require-minimum:
+        description: >-
+          Minimum number of non ignored check runs that must exist once settled. Below this
+          the gate looks at the workflow runs for the sha to tell a dropped event apart from
+          correct path filtering, then fails with conclusion `missing`.
+        type: number
+        required: false
+        default: 1
+      allow-no-checks:
+        description: >-
+          Treat a sha with no check runs AND no workflow runs at all as a pass. This is the
+          deliberate opt in for a change that legitimately triggers nothing, a docs only path
+          for example. It has no effect when workflow runs exist, since runs that produce no
+          check runs are anomalous either way. Default false keeps silence failing.
+        type: boolean
+        required: false
+        default: false
+      runs-on:
+        description: "Runner label."
+        type: string
+        required: false
+        default: "ubuntu-latest"
+    outputs:
+      conclusion:
+        description: "One of `success`, `failed`, `cancelled`, `missing`, `timeout`."
+        value: ${{ jobs.gate.outputs.conclusion }}
+      summary:
+        description: "One human readable line describing the verdict."
+        value: ${{ jobs.gate.outputs.summary }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Gate on check runs
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      checks: read
+      contents: read
+      actions: read
+    outputs:
+      conclusion: ${{ steps.gate.outputs.conclusion }}
+      summary: ${{ steps.gate.outputs.summary }}
+    steps:
+      - name: Read the check runs for the sha
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          TARGET_SHA: ${{ inputs.sha }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          POLL_SECONDS: ${{ inputs.poll-seconds }}
+          IGNORE_CHECKS: ${{ inputs.ignore-checks }}
+          REQUIRE_MINIMUM: ${{ inputs.require-minimum }}
+          ALLOW_NO_CHECKS: ${{ inputs.allow-no-checks }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "$TARGET_SHA" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
+            echo "::error::sha must be a hex commit sha, got '${TARGET_SHA}'"
+            exit 1
+          fi
+
+          if ! printf '%s' "$TARGET_REPOSITORY" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::repository must be owner/repo, got '${TARGET_REPOSITORY}'"
+            exit 1
+          fi
+
+          IGNORED_JSON=$(printf '%s\n' "$IGNORE_CHECKS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+            | jq -R . | jq -s '[.[] | select(. != "")]')
+
+          emit() {
+            {
+              echo "conclusion=$1"
+              echo "summary=$2"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          fetch_checks() {
+            gh api \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${TARGET_REPOSITORY}/commits/${TARGET_SHA}/check-runs?per_page=100&filter=latest" \
+              --jq '.check_runs[] | {name, status, conclusion}' \
+              | jq -s --argjson ignored "$IGNORED_JSON" \
+                '[.[] | select(.name as $n | $ignored | index($n) | not)]'
+          }
+
+          count_workflow_runs() {
+            gh api \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${TARGET_REPOSITORY}/actions/runs?head_sha=${TARGET_SHA}&per_page=100" \
+              --jq '.workflow_runs[].id' \
+              | sort -u | grep -c . || true
+          }
+
+          WORKFLOW_RUNS="not queried"
+
+          write_summary() {
+            local CHECKS VERDICT LINE
+            CHECKS="$1"
+            VERDICT="$2"
+            LINE="$3"
+            {
+              echo "## Check runs gate"
+              echo
+              echo "| Field | Value |"
+              echo "| --- | --- |"
+              echo "| repository | \`${TARGET_REPOSITORY}\` |"
+              echo "| sha | \`${TARGET_SHA}\` |"
+              echo "| verdict | \`${VERDICT}\` |"
+              echo "| check runs found | \`$(printf '%s' "$CHECKS" | jq 'length')\` |"
+              echo "| workflow runs found | \`${WORKFLOW_RUNS}\` |"
+              echo "| ignored | \`$(printf '%s' "$IGNORED_JSON" | jq -r 'if length == 0 then "none" else join(", ") end')\` |"
+              echo
+              echo "$LINE"
+              echo
+              if [ "$(printf '%s' "$CHECKS" | jq 'length')" -eq 0 ]; then
+                echo "No check runs were counted on this sha."
+              else
+                echo "| Check | Status | Conclusion |"
+                echo "| --- | --- | --- |"
+                printf '%s' "$CHECKS" | jq -r \
+                  '.[] | "| `\(.name)` | `\(.status)` | `\(.conclusion // "pending")` |"'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          finish() {
+            local CHECKS VERDICT LINE
+            CHECKS="$1"
+            VERDICT="$2"
+            LINE="$3"
+            write_summary "$CHECKS" "$VERDICT" "$LINE"
+            emit "$VERDICT" "$LINE"
+            if [ "$VERDICT" = "success" ]; then
+              echo "$LINE"
+              exit 0
+            fi
+            echo "::error::${LINE}"
+            exit 1
+          }
+
+          DEADLINE=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          CHECKS='[]'
+
+          while true; do
+            CHECKS=$(fetch_checks)
+            TOTAL=$(printf '%s' "$CHECKS" | jq 'length')
+            PENDING=$(printf '%s' "$CHECKS" | jq '[.[] | select(.status != "completed")] | length')
+
+            if [ "$TOTAL" -ge "$REQUIRE_MINIMUM" ] && [ "$PENDING" -eq 0 ]; then
+              break
+            fi
+
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              if [ "$PENDING" -gt 0 ]; then
+                PENDING_NAMES=$(printf '%s' "$CHECKS" \
+                  | jq -r '[.[] | select(.status != "completed") | .name] | join(", ")')
+                WORKFLOW_RUNS=$(count_workflow_runs)
+                finish "$CHECKS" timeout \
+                  "Still pending after ${TIMEOUT_MINUTES} minutes on ${TARGET_SHA}: ${PENDING_NAMES}. No verdict was reached, so this is not a pass."
+              fi
+              break
+            fi
+
+            if [ "$TOTAL" -lt "$REQUIRE_MINIMUM" ]; then
+              echo "Only ${TOTAL} check runs on ${TARGET_SHA}, need ${REQUIRE_MINIMUM}. Waiting ${POLL_SECONDS}s."
+            else
+              echo "${PENDING} of ${TOTAL} check runs still running on ${TARGET_SHA}. Waiting ${POLL_SECONDS}s."
+            fi
+            sleep "$POLL_SECONDS"
+          done
+
+          TOTAL=$(printf '%s' "$CHECKS" | jq 'length')
+          WORKFLOW_RUNS=$(count_workflow_runs)
+
+          if [ "$TOTAL" -lt "$REQUIRE_MINIMUM" ]; then
+            if [ "$WORKFLOW_RUNS" -gt 0 ]; then
+              finish "$CHECKS" missing \
+                "Only ${TOTAL} check runs exist on ${TARGET_SHA}, fewer than the ${REQUIRE_MINIMUM} required, yet ${WORKFLOW_RUNS} workflow runs exist for this sha. Workflows ran but produced no check runs, which is genuinely anomalous. Silence is not success, so nothing here verifies this commit."
+            fi
+
+            if [ "$ALLOW_NO_CHECKS" = "true" ]; then
+              finish "$CHECKS" success \
+                "No workflow was triggered for ${TARGET_SHA}, no check runs and no workflow runs, and the caller set allow-no-checks so this is treated as a pass."
+            fi
+
+            finish "$CHECKS" missing \
+              "No workflow was triggered for ${TARGET_SHA} at all, no check runs and no workflow runs. That is either a dropped event or path filters correctly skipping every workflow, and this gate cannot tell which, so the caller must decide. Silence is not success. Set allow-no-checks to true if a change that triggers nothing is expected here."
+          fi
+
+          FAILED=$(printf '%s' "$CHECKS" \
+            | jq -r '[.[] | select(.conclusion == "failure") | .name] | join(", ")')
+          if [ -n "$FAILED" ]; then
+            finish "$CHECKS" failed \
+              "Failed check runs on ${TARGET_SHA}: ${FAILED}."
+          fi
+
+          NO_VERDICT=$(printf '%s' "$CHECKS" \
+            | jq -r '[.[] | select(.conclusion as $c | ["cancelled", "timed_out", "stale", "action_required"] | index($c)) | "\(.name) (\(.conclusion))"] | join(", ")')
+          if [ -n "$NO_VERDICT" ]; then
+            finish "$CHECKS" cancelled \
+              "No verdict on ${TARGET_SHA}: ${NO_VERDICT}. These check runs did not fail, they never reached a conclusion, so re-run them rather than treating this as a real failure."
+          fi
+
+          UNKNOWN=$(printf '%s' "$CHECKS" \
+            | jq -r '[.[] | select(.conclusion as $c | ["success", "skipped", "neutral"] | index($c) | not) | "\(.name) (\(.conclusion // "none"))"] | join(", ")')
+          if [ -n "$UNKNOWN" ]; then
+            finish "$CHECKS" failed \
+              "Unrecognised conclusions on ${TARGET_SHA}: ${UNKNOWN}. Refusing to read an unknown conclusion as a pass."
+          fi
+
+          finish "$CHECKS" success \
+            "All ${TOTAL} check runs on ${TARGET_SHA} passed, were skipped or were neutral."
