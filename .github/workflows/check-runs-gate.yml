@@ -34,9 +34,10 @@ on:
         default: ""
       require-minimum:
         description: >-
-          Minimum number of non ignored check runs that must exist once settled. Below this
-          the gate looks at the workflow runs for the sha to tell a dropped event apart from
-          correct path filtering, then fails with conclusion `missing`.
+          Minimum number of non ignored check runs that must exist once settled, counted
+          after deduplication. Below this the gate looks at the workflow runs for the sha to
+          tell a dropped event apart from correct path filtering, then fails with conclusion
+          `missing`.
         type: number
         required: false
         default: 1
@@ -113,14 +114,30 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           }
 
+          fetch_suite_workflows() {
+            gh api \
+              --paginate \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${TARGET_REPOSITORY}/actions/runs?head_sha=${TARGET_SHA}&per_page=100" \
+              --jq '.workflow_runs[] | {suite: (.check_suite_id | tostring), workflow: (.workflow_id | tostring)}' \
+              | jq -s 'map({key: .suite, value: .workflow}) | from_entries'
+          }
+
           fetch_checks() {
+            local SUITE_WORKFLOWS
+            SUITE_WORKFLOWS=$(fetch_suite_workflows)
             gh api \
               --paginate \
               -H "Accept: application/vnd.github+json" \
               "repos/${TARGET_REPOSITORY}/commits/${TARGET_SHA}/check-runs?per_page=100&filter=latest" \
-              --jq '.check_runs[] | {name, status, conclusion}' \
-              | jq -s --argjson ignored "$IGNORED_JSON" \
-                '[.[] | select(.name as $n | $ignored | index($n) | not)]'
+              --jq '.check_runs[] | {name, status, conclusion, id, started_at, suite: (.check_suite.id | tostring), app: ((.app.id // 0) | tostring)}' \
+              | jq -s --argjson ignored "$IGNORED_JSON" --argjson suites "$SUITE_WORKFLOWS" \
+                '[.[] | select(.name as $n | $ignored | index($n) | not)]
+                 | map(. + {identity: (.app + ":" + ($suites[.suite] // ("suite:" + .suite)) + ":" + .name)})
+                 | group_by(.identity)
+                 | map(sort_by([(.started_at // ""), .id]) | last)
+                 | sort_by([(.started_at // ""), .id])
+                 | map({name, status, conclusion})'
           }
 
           count_workflow_runs() {
