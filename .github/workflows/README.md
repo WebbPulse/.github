@@ -1921,6 +1921,25 @@ so the opt in is a decision in the caller rather than the gate silently forgivin
 The step summary always prints both counts, so whoever reads the run can see which row of
 that table they landed in.
 
+### Absence of one name is weaker evidence than absence of all names
+
+The table above reads an empty check list. A caller that waits on one named check reads
+something narrower, and the same empty result now has a third cause. An aggregating check
+such as `all-checks-passed` does not exist until the jobs it summarises have finished, so
+while a run is in progress it is genuinely absent. Dropped event, correct path filtering and
+still running all look identical to a waiter polling for that one name, and only the third
+resolves itself.
+
+This gate does not have the problem, because it polls every check run on the sha and honours
+`status`, so an unfinished run keeps it waiting rather than reading as missing. The trap
+belongs to hand written waiters, and it is worth stating because the obvious thing to poll
+for is exactly the aggregating check.
+
+If a specific name is missing, count the other check runs on the sha before concluding
+anything. Any at all means work is under way and the right move is to keep waiting. It is
+the same widening that turns a negative check into a real answer: ask what exists rather
+than whether one expected thing does.
+
 ### A green third-party status is not evidence
 
 This gate counts check runs and workflow runs, which are things that actually executed. Some
