@@ -1930,6 +1930,21 @@ creating a configuration version. Treat a status of that kind as unverified. It 
 substitute for this gate, and a repository that relies on one is back in failure mode 2 with
 a green tick on top.
 
+### A green suite is not evidence about data already written
+
+This gate verifies that checks ran and what they concluded. It cannot tell you that the data
+in an environment is correct, and a passing suite is not evidence that it is. After a change
+to how rows are keyed, named or indexed, tests write new rows in the new shape and read them
+back, so the suite goes green while rows written before the change keep the old shape. The
+failure is silent by construction: nothing in the run ever looks at them. A renamed GSI key
+attribute is the worst version, because the index simply indexes nothing and every assertion
+still passes.
+
+That check belongs in the product's own runbook, not here, because catching it means knowing
+that product's schema. What is general is the reading rule: treat a green suite as evidence
+about the code path the tests exercised and about nothing else. Audit pre-existing rows
+separately, before the change that strands them.
+
 ### The reading rule
 
 | Conclusion | Counted as |
