@@ -1902,6 +1902,39 @@ checks" aggregates across heads, so a green answer can come from a commit two pu
 mean, which on a `pull_request` event is `github.event.pull_request.head.sha` and not
 `github.sha`, the merge commit nobody is looking at.
 
+### `filter=latest` does not mean the latest run on the sha
+
+The check runs API takes `filter=latest`, and the obvious reading of the name is wrong. It
+deduplicates by check name *within a single check suite*, not across the sha. Each workflow
+run gets its own suite, so when two runs exist for one commit both are the latest of their
+own suite and both survive the filter. The response then holds the same check name more than
+once with conclusions that disagree.
+
+Close and reopen a pull request, or push twice in quick succession, and that is exactly what
+happens. `cancel-in-progress` cancels the first run seconds in while the second goes on to
+pass, and the sha ends up carrying a cancelled copy and a successful copy of every name. Code
+that scans the whole list for a `failure` finds the superseded run's aggregating check and
+reports a failure for a commit that is entirely green, which is failure mode 1 arriving
+through the filter that was supposed to prevent it.
+
+So the gate deduplicates itself rather than trusting the flag. It reads the workflow runs for
+the sha, maps each check suite to the workflow that owns it, and keys every check run on the
+owning workflow plus the publishing app plus the check name. Within a key it keeps only the
+newest attempt, ordered by `started_at` and broken by check run id, since `started_at` is
+only accurate to the second and two runs can start inside the same second. Superseded runs
+drop out before any conclusion is read, so they cannot produce a verdict.
+
+The key is deliberately not the name alone. Two different workflows may each define a job
+called `build`, and collapsing those into one entry would discard a real failure from one of
+them. Keying on the owning workflow keeps genuinely distinct checks apart while still folding
+away repeat runs of the same workflow. A check suite with no matching workflow run, which is
+what a third-party app produces, falls back to its own suite id and is left alone.
+
+Deduplication happens before the count as well as before the verdict, so `require-minimum`
+counts distinct checks. This matters in both directions: the duplicates used to inflate the
+count, so a sha with three real checks reported six and satisfied a floor of four that it
+should have failed.
+
 ### Empty is ambiguous, so the gate disambiguates
 
 Zero check runs does not always mean a dropped event. A docs only pull request can
@@ -2000,7 +2033,7 @@ If the gate runs inside a workflow that itself publishes a check run on the same
 check run is `in_progress` for as long as the gate is polling, so the gate would wait for
 itself until it timed out. Put those names in `ignore-checks`, newline or comma separated.
 Ignored names are excluded from the count as well as the verdict, which is why
-`require-minimum` counts non ignored checks only.
+`require-minimum` counts non ignored checks only, after deduplication.
 
 Set the two together with care. The floor you would pick by counting the checks you see on a
 pull request includes the ones you are about to ignore, so carrying that number into
