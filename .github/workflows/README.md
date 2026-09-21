@@ -1945,6 +1945,22 @@ that product's schema. What is general is the reading rule: treat a green suite 
 about the code path the tests exercised and about nothing else. Audit pre-existing rows
 separately, before the change that strands them.
 
+### A negative check is not evidence either
+
+The same trap runs in reverse, and it is worth knowing because the response is different.
+A verification that comes back empty looks like proof a change did not land, which reads as a
+partial apply: the resource arrived, the permission did not, the kind of gap that surfaces
+much later as a runtime denial rather than a red run. But a query that inspects the wrong
+subset returns empty too, and it does not error. Reading an IAM role's first inline policy
+when the grant sits in the third is indistinguishable, at the terminal, from the grant being
+absent.
+
+When a check contradicts a plan or an apply that said the change was made, suspect the query
+before the infrastructure. The plan is the stronger evidence: it named what it would do and
+reported doing it, while the check is a single narrow question that may not be pointed at the
+thing. Widen it, list what actually exists rather than indexing into it, and only then
+conclude something is missing.
+
 ### The reading rule
 
 | Conclusion | Counted as |
@@ -1966,6 +1982,12 @@ check run is `in_progress` for as long as the gate is polling, so the gate would
 itself until it timed out. Put those names in `ignore-checks`, newline or comma separated.
 Ignored names are excluded from the count as well as the verdict, which is why
 `require-minimum` counts non ignored checks only.
+
+Set the two together with care. The floor you would pick by counting the checks you see on a
+pull request includes the ones you are about to ignore, so carrying that number into
+`require-minimum` sets it too high by exactly the number of ignored names, and the gate
+reports `missing` on a commit whose checks all passed. The number is the only symptom, which
+makes it read like a dropped event rather than a misconfigured floor.
 
 ### Inputs
 
