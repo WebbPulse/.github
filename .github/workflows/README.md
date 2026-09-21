@@ -1971,7 +1971,40 @@ for is exactly the aggregating check.
 If a specific name is missing, count the other check runs on the sha before concluding
 anything. Any at all means work is under way and the right move is to keep waiting. It is
 the same widening that turns a negative check into a real answer: ask what exists rather
-than whether one expected thing does.
+than whether one expected thing does. And if the name is present with a definite
+`failure`, check the conclusion of the workflow run that owns it before believing it, for
+the reason the next section gives.
+
+### An aggregating check's `failure` does not mean the work failed
+
+The mirror of the section above. There the aggregating check is absent and the absence is
+read as a verdict; here it is present, reports a definite conclusion, and that conclusion is
+wrong. A job like `all-checks-passed` that depends on every other job fails when any
+dependency does not succeed, and a dependency that was cancelled does not succeed. So the
+aggregator reports `failure` whether the work was broken or the run was simply killed
+mid flight.
+
+Two commits in `WebbPulse/Standupless` show it. `0224ea9` is a genuine Prettier failure and
+`63551d4` is green work whose run a force push cancelled. At the check run level the two are
+byte for byte the same answer, `all-checks-passed | completed/failure`. At the workflow run
+level they separate cleanly: run 35566138513 is `completed/failure` and run 35566458071 is
+`completed/cancelled`. The check run is a lossy projection of the run that produced it, and
+the distinction survives one layer up, in the Actions runs API for the sha, in the run's own
+`conclusion` field.
+
+This gate is not immune to it the way it is immune to the absence problem. Polling every
+check run and honouring `status` is what saves it there, and it does nothing here: an
+aggregator that has finished reports a completed `failure`, the gate reads that conclusion at
+face value, and nothing in the gate currently re-reads the owning workflow run's conclusion to
+find out which kind of `failure` it was. Treat that as a known limitation. When an aggregating
+check reports a definite `failure`, check the conclusion of the run that owns it before
+acting on the verdict.
+
+The reading rule is what is at stake. `cancelled` means no verdict and re-run it, `failure`
+means a real failure and go debug it, and an aggregating check quietly converts the first into
+the second. Anything that tests for `failure` first gets a confident wrong answer and sends
+someone hunting a bug that does not exist, which is failure mode 1 again, arriving through yet
+another door.
 
 ### A green third-party status is not evidence
 
