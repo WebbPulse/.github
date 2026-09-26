@@ -1,22 +1,17 @@
-name: Terraform Run Ingest
+name: Terraform Run Upload
 
 on:
   workflow_call:
     inputs:
-      role-arn:
-        description: "IAM role ARN assumed through GitHub OIDC. It must allow s3:PutObject on the ingest prefix of the bucket and kms:GenerateDataKey on the bucket key."
+      api-url:
+        description: "WebbPulse-Terraform API base URL, https with no path, for example https://api.example.com."
         type: string
         required: true
-      bucket:
-        description: "S3 bucket the WebbPulse-Terraform control plane reads configuration uploads from."
-        type: string
-        required: true
-      region:
-        description: "AWS region of the bucket."
+      audience:
+        description: "Audience requested for the GitHub OIDC token the API verifies."
         type: string
         required: false
-        default: "us-west-2"
-
+        default: "webbpulse-terraform"
 permissions:
   contents: read
 
@@ -37,8 +32,18 @@ jobs:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PUSH_SHA: ${{ github.sha }}
+          API_URL: ${{ inputs.api-url }}
+          AUDIENCE: ${{ inputs.audience }}
         run: |
           set -euo pipefail
+          if ! printf '%s' "$API_URL" | grep -Eq '^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?/?$'; then
+            echo "::error title=terraform-run::api-url '${API_URL}' must be https://<host>[:port] with no path beyond an optional trailing slash."
+            exit 1
+          fi
+          if ! printf '%s' "$AUDIENCE" | grep -Eq '^[A-Za-z0-9._:/-]+$'; then
+            echo "::error title=terraform-run::audience '${AUDIENCE}' is empty or holds unsupported characters."
+            exit 1
+          fi
           case "$EVENT_NAME" in
             pull_request)
               event="pr"
@@ -138,80 +143,171 @@ jobs:
           ls -l "$RUNNER_TEMP/configuration.tar.gz"
           sha256sum "$RUNNER_TEMP/configuration.tar.gz"
 
-      - name: Build the object key and metadata
-        id: object
-        if: steps.resolve.outputs.skip != 'true'
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT: ${{ steps.resolve.outputs.event }}
-          SHA: ${{ steps.resolve.outputs.sha }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          ACTOR: ${{ github.actor }}
-          PUSH_REF: ${{ github.ref }}
-          PUSH_BEFORE: ${{ github.event.before }}
-          PR_HEAD_REF: ${{ github.head_ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          repo_name="${REPOSITORY#*/}"
-          key="ingest/${repo_name}/${EVENT}/${SHA}-${RUN_ID}-${RUN_ATTEMPT}.tar.gz"
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            metadata="$(jq -cn \
-              --arg repo "$REPOSITORY" \
-              --arg sha "$SHA" \
-              --arg ref "$PR_HEAD_REF" \
-              --arg event "$EVENT" \
-              --arg pr "$PR_NUMBER" \
-              --arg base "$PR_BASE_SHA" \
-              --arg actor "$ACTOR" \
-              '{"repo": $repo, "sha": $sha, "ref": $ref, "event": $event, "pr-number": $pr, "base-sha": $base, "actor": $actor}')"
-          else
-            metadata="$(jq -cn \
-              --arg repo "$REPOSITORY" \
-              --arg sha "$SHA" \
-              --arg ref "$PUSH_REF" \
-              --arg event "$EVENT" \
-              --arg base "$PUSH_BEFORE" \
-              --arg actor "$ACTOR" \
-              '{"repo": $repo, "sha": $sha, "ref": $ref, "event": $event, "base-sha": $base, "actor": $actor}')"
-          fi
-          if printf '%s' "$metadata" | jq -e '[.[] | test("^[\\x20-\\x7e]*$")] | all | not' > /dev/null; then
-            echo "::error title=terraform-run::A metadata value holds characters outside printable ASCII, which S3 user metadata cannot carry. Rename the branch to ASCII."
-            exit 1
-          fi
-          {
-            echo "key=${key}"
-            echo "metadata=${metadata}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Configure AWS credentials via OIDC
-        if: steps.resolve.outputs.skip != 'true'
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
-        with:
-          role-to-assume: ${{ inputs.role-arn }}
-          aws-region: ${{ inputs.region }}
-
       - name: Upload the configuration
         if: steps.resolve.outputs.skip != 'true'
         env:
-          BUCKET: ${{ inputs.bucket }}
-          KEY: ${{ steps.object.outputs.key }}
-          METADATA: ${{ steps.object.outputs.metadata }}
+          API_URL: ${{ inputs.api-url }}
+          AUDIENCE: ${{ inputs.audience }}
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          aws s3 cp "$RUNNER_TEMP/configuration.tar.gz" "s3://${BUCKET}/${KEY}" \
-            --sse aws:kms \
-            --metadata "$METADATA" \
-            --content-type application/gzip \
-            --no-progress
+          umask 077
+          work="$(mktemp -d "$RUNNER_TEMP/terraform-run.XXXXXX")"
+          tarball="$RUNNER_TEMP/configuration.tar.gz"
+          api="${API_URL%/}"
+
+          audience_query="$(jq -rn --arg a "$AUDIENCE" '$a | @uri')"
+          if ! curl -sS --fail --retry 3 --retry-all-errors --retry-delay 2 \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            -o "$work/oidc.json" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience_query}"; then
+            echo "::error title=terraform-run::Could not obtain a GitHub OIDC token."
+            exit 1
+          fi
+          token="$(jq -r '.value // empty' "$work/oidc.json")"
+          rm -f "$work/oidc.json"
+          if [ -z "$token" ]; then
+            echo "::error title=terraform-run::The GitHub OIDC response held no token."
+            exit 1
+          fi
+          echo "::add-mask::${token}"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            pr="$PR_NUMBER"
+          else
+            base="$PUSH_BEFORE"
+            pr=""
+          fi
+          size="$(stat -c %s "$tarball")"
+          jq -cn \
+            --arg sha "$SHA" \
+            --arg pr "$pr" \
+            --arg base "$base" \
+            --argjson size "$size" \
+            '{
+              "sha": $sha,
+              "pr_number": (if $pr == "" then null else ($pr | tonumber) end),
+              "base_sha": (if $base == "" or ($base | test("^0+$")) then null else $base end),
+              "size_bytes": $size
+            }' > "$work/request.json"
+          echo "Request: $(cat "$work/request.json")"
+
+          status=000
+          for attempt in 1 2 3 4; do
+            status="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${token}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              --data-binary "@$work/request.json" \
+              "${api}/api/v1/vcs/uploads")" || status=000
+            case "$status" in
+              000|5??)
+                if [ "$attempt" -lt 4 ]; then
+                  echo "::warning title=terraform-run::POST ${api}/api/v1/vcs/uploads returned ${status}, retrying."
+                  sleep $((attempt * 3))
+                  continue
+                fi
+                ;;
+            esac
+            break
+          done
+
+          if [ "$status" = "404" ]; then
+            code="$(jq -r 'try (.error_code // empty | strings) catch empty' "$work/response.json" 2>/dev/null || true)"
+            if [ "$code" = "VCS_REPO_NOT_BOUND" ]; then
+              echo "::notice title=terraform-run skipped::This repository is not connected to a WebbPulse Terraform workspace, so no configuration was uploaded."
+              exit 0
+            fi
+          fi
+          if [ "$status" != "201" ]; then
+            echo "::error title=terraform-run::POST ${api}/api/v1/vcs/uploads returned ${status}."
+            head -c 4096 "$work/response.json" 2>/dev/null || true
+            echo
+            exit 1
+          fi
+
+          upload_url="$(jq -r '.upload_url // empty' "$work/response.json")"
+          upload_id="$(jq -r '.upload_id // empty' "$work/response.json")"
+          if [ -n "$upload_url" ]; then
+            echo "::add-mask::${upload_url}"
+            query="${upload_url#*\?}"
+            if [ "$query" != "$upload_url" ] && [ -n "$query" ]; then
+              echo "::add-mask::${query}"
+              while IFS= read -r -d '&' pair; do
+                value="${pair#*=}"
+                if [ -n "$value" ] && [ "$value" != "$pair" ]; then
+                  echo "::add-mask::${value}"
+                  decoded="$(printf '%s' "$value" | sed 's/+/ /g; s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"
+                  decoded="$(printf '%b' "$decoded")"
+                  if [ "$decoded" != "$value" ]; then
+                    echo "::add-mask::${decoded}"
+                  fi
+                fi
+              done <<< "${query}&"
+            fi
+          fi
+          if [ -z "$upload_id" ] || ! printf '%s' "$upload_url" | grep -Eq '^https://'; then
+            echo "::error title=terraform-run::The API response lacked an upload_id or an https upload_url."
+            exit 1
+          fi
+          if ! jq -e '(.headers // {}) | type == "object"' "$work/response.json" > /dev/null; then
+            echo "::error title=terraform-run::The API response headers field is not an object."
+            exit 1
+          fi
+
+          put_headers=()
+          while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+            if ! printf '%s' "$name" | grep -Eq '^[A-Za-z0-9!#$%&'"'"'*+.^_`|~-]+$'; then
+              echo "::error title=terraform-run::The API returned an invalid upload header name."
+              exit 1
+            fi
+            case "$value" in
+              *$'\r'*|*$'\n'*)
+                echo "::error title=terraform-run::The API returned an upload header value with a line break."
+                exit 1
+                ;;
+            esac
+            if [ -n "$value" ]; then
+              echo "::add-mask::${value}"
+              put_headers+=(-H "${name}: ${value}")
+            else
+              put_headers+=(-H "${name};")
+            fi
+          done < <(jq -j '(.headers // {}) | to_entries[] | "\(.key)\u0000\(.value | tostring)\u0000"' "$work/response.json")
+          rm -f "$work/response.json"
+
+          put_status="$(curl -sS --retry 3 --retry-all-errors --retry-delay 2 \
+            -o "$work/put.txt" -w '%{http_code}' \
+            -X PUT \
+            "${put_headers[@]}" \
+            --upload-file "$tarball" \
+            "$upload_url")" || put_status=000
+          case "$put_status" in
+            2??)
+              ;;
+            *)
+              echo "::error title=terraform-run::Upload ${upload_id} PUT returned ${put_status}."
+              head -c 4096 "$work/put.txt" 2>/dev/null || true
+              echo
+              exit 1
+              ;;
+          esac
+          rm -rf "$work"
+
+          echo "Uploaded ${size} bytes as upload ${upload_id}."
+          safe_id="$(printf '%s' "$upload_id" | tr -cd 'A-Za-z0-9._:-')"
           {
             echo "### Configuration uploaded"
             echo
-            echo "- Key: \`${KEY}\`"
-            echo "- Metadata: \`${METADATA}\`"
+            echo "- Upload id: \`${safe_id}\`"
+            echo "- Commit: \`${SHA}\`"
+            echo "- Size: ${size} bytes"
             echo
             echo "The WebbPulse-Terraform control plane picks the run up from here."
           } >> "$GITHUB_STEP_SUMMARY"
