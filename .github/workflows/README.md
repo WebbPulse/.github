@@ -1872,9 +1872,10 @@ jobs:
 ## `terraform-run.yml`
 
 The VCS bridge for the WebbPulse-Terraform control plane. On a pull request or a push it
-packs the repository at the exact commit into a tarball and uploads it to the control
-plane's ingest bucket, then exits. **It never runs Terraform and never waits for the run.**
-The control plane picks the object up and owns everything after the upload.
+packs the repository at the exact commit into a tarball, asks the WebbPulse-Terraform API
+for an upload slot with a GitHub OIDC token, uploads the tarball there, and exits. **It
+never runs Terraform and never waits for the run.** The control plane owns everything
+after the upload.
 
 The caller chooses which branches and paths trigger it in its own `on:` block. Only
 `pull_request` and `push` are supported; any other event fails the job with an error.
@@ -1882,11 +1883,11 @@ The caller chooses which branches and paths trigger it in its own `on:` block. O
 
 | Input | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `role-arn` | string | required | Role assumed through OIDC. Needs `s3:PutObject` on the ingest prefix and `kms:GenerateDataKey` on the bucket key. |
-| `bucket` | string | required | The control plane's ingest bucket. |
-| `region` | string | `us-west-2` | Region of the bucket. |
+| `api-url` | string | required | API base URL, for example `https://api.example.com`. Must be `https://<host>[:port]` with no path beyond an optional trailing slash, or the job fails. |
+| `audience` | string | `webbpulse-terraform` | Audience of the GitHub OIDC token the API verifies. |
 
-Secrets: none. Outputs: none. The object key and metadata are written to the step summary.
+Secrets: none. Outputs: none. The upload id is written to the step summary. There is no
+AWS role, bucket or region: the API decides where the tarball goes.
 
 ### What is uploaded
 
@@ -1907,38 +1908,46 @@ sorted, with mtime 0, owner and group 0, and no gzip name or timestamp, so the s
 produces the same bytes. It excludes `.git`, every `.terraform` directory at any depth,
 and anything matching `*.tfstate*`. `.terraform.lock.hcl` is kept.
 
-The object is uploaded with `aws s3 cp --sse aws:kms` to
+### The API exchange
 
-```text
-s3://<bucket>/ingest/<repo-name>/<event>/<sha>-<run_id>-<run_attempt>.tar.gz
-```
+1. The workflow requests a GitHub OIDC token for `audience` and masks it at once.
+2. It sends `POST <api-url>/api/v1/vcs/uploads` with `Authorization: Bearer <token>`,
+   `Content-Type: application/json` and this body, built with `jq` from environment
+   variables:
 
-where `<repo-name>` is the repository name without the owner and `<event>` is `pr` or
-`push`. A re-run gets a new `run_attempt` and so a new key.
+   ```json
+   {"sha": "<head sha>", "pr_number": 12, "base_sha": "<sha>", "size_bytes": 20480}
+   ```
 
-User metadata, readable as `x-amz-meta-<name>`:
+   `sha` is the checked out commit. `pr_number` is a JSON number on a pull request and
+   `null` on a push. `base_sha` is the pull request base sha or the push `before`, and
+   `null` when that is empty or all zeros. `size_bytes` is the tarball's size.
+3. A `201` must carry `{"upload_id", "upload_url", "headers"}`. `upload_url` must be
+   https. The tarball is sent with `PUT` to `upload_url` carrying every entry of `headers`
+   verbatim, and any status outside `2xx` fails the job.
 
-| Key | `pull_request` | `push` |
-| --- | --- | --- |
-| `repo` | `owner/name` | `owner/name` |
-| `sha` | head sha | `github.sha` |
-| `ref` | head branch name, for example `feature/x` | full ref, for example `refs/heads/main` |
-| `event` | `pr` | `push` |
-| `pr-number` | pull request number | absent |
-| `base-sha` | pull request base sha | `github.event.before`, all zeros for a new branch |
-| `actor` | `github.actor` | `github.actor` |
+A `404` whose body has top-level `"error_code": "VCS_REPO_NOT_BOUND"`, the standard
+WebbPulse product error envelope, means the repository is not connected to a WebbPulse
+Terraform workspace. The workflow prints a notice and succeeds. Only that top-level
+`error_code` field is read; a code nested anywhere else does not count. Any status
+other than `201` fails the job, printing the status and up to 4 KiB of the response body.
+
+The `POST` is retried up to three more times on a connection error or a `5xx`. The `PUT`
+to the presigned URL is idempotent, so curl retries it three times on any error.
 
 ### Security
 
-Branch names, the actor and every other event field are attacker influenced. The workflow
-never interpolates them into a script: they reach each step through `env:`, and the
-metadata map is built with `jq --arg`, so quoting cannot break out. S3 user metadata only
-carries printable ASCII, so a branch name outside that range fails the job with an error
-rather than being mangled.
-
-A pull request from a fork gets no OIDC token. The workflow detects that, and any other
-pull request run with no token, writes a notice and succeeds without uploading. A `push`
-run with no token fails, because it means the caller did not grant `id-token: write`.
+- Branch names, the actor and every other event field are attacker influenced. None is
+  interpolated into a script: each reaches its step through `env:`, and the request body
+  is built with `jq --arg`.
+- The OIDC token is masked as soon as it is read and never printed. `upload_url`, its
+  query string, each query parameter value (encoded and decoded), and every header value
+  are masked before the `PUT`, since they may be presigned credentials. Header names are
+  checked against the HTTP token grammar and values with a line break are rejected, and
+  the curl arguments are built as a bash array, never through `eval`.
+- A pull request from a fork gets no OIDC token. The workflow detects that, and any other
+  pull request run with no token, writes a notice and succeeds without uploading. A `push`
+  run with no token fails, because it means the caller did not grant `id-token: write`.
 
 ### The caller
 
@@ -1956,12 +1965,12 @@ jobs:
       contents: read
     uses: WebbPulse/.github/.github/workflows/terraform-run.yml@v3
     with:
-      role-arn: ${{ vars.TERRAFORM_INGEST_ROLE_ARN }}
-      bucket: ${{ vars.TERRAFORM_INGEST_BUCKET }}
+      api-url: ${{ vars.TERRAFORM_API_URL }}
 ```
 
-The role's trust policy scopes `token.actions.githubusercontent.com:sub` to the repository,
-in the immutable subject form new repositories issue.
+`TERRAFORM_API_URL` is a repository or Environment variable, because this repository
+carries no estate specific hostnames. The API binds the repository to a workspace from the
+token's claims, so the caller passes nothing else.
 
 ---
 
