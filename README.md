@@ -53,6 +53,9 @@ One line each, pointing at the section that documents the inputs, secrets and be
 - [`terraform-speculative-plan.yml`](.github/workflows/README.md#terraform-speculative-planyml)
   runs `terraform fmt -check`, `init` and `validate` on a pull request touching
   `terraform/**`, and nothing else.
+- [`terraform-run.yml`](.github/workflows/README.md#terraform-runyml) packs the
+  repository at the exact commit and uploads it to the WebbPulse-Terraform ingest bucket,
+  without running Terraform.
 
 ## Pinning
 

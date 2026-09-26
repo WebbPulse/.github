@@ -1,0 +1,217 @@
+name: Terraform Run Ingest
+
+on:
+  workflow_call:
+    inputs:
+      role-arn:
+        description: "IAM role ARN assumed through GitHub OIDC. It must allow s3:PutObject on the ingest prefix of the bucket and kms:GenerateDataKey on the bucket key."
+        type: string
+        required: true
+      bucket:
+        description: "S3 bucket the WebbPulse-Terraform control plane reads configuration uploads from."
+        type: string
+        required: true
+      region:
+        description: "AWS region of the bucket."
+        type: string
+        required: false
+        default: "us-west-2"
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    name: Upload configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Resolve the event
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request)
+              event="pr"
+              sha="$PR_HEAD_SHA"
+              if [ "$HEAD_REPO" != "$REPOSITORY" ]; then
+                echo "::notice title=terraform-run skipped::Pull request from fork ${HEAD_REPO} gets no OIDC token, so no configuration was uploaded."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                echo "::notice title=terraform-run skipped::This pull request run has no OIDC token, so no configuration was uploaded."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            push)
+              event="push"
+              sha="$PUSH_SHA"
+              if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+                echo "::error title=terraform-run::No OIDC token. The calling job must grant permissions id-token: write and contents: read."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error title=terraform-run::Unsupported event '${EVENT_NAME}'. terraform-run.yml supports only pull_request and push."
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error title=terraform-run::Commit sha '${sha}' is not a 40 character hex sha."
+            exit 1
+          fi
+          {
+            echo "skip=false"
+            echo "event=${event}"
+            echo "sha=${sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the exact commit
+        if: steps.resolve.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Write the changed paths
+        if: steps.resolve.outputs.skip != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$PUSH_BEFORE"
+          fi
+          out=.webbpulse/changed-paths.txt
+          mkdir -p .webbpulse
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth#AUTHORIZATION: basic }"
+          if ! printf '%s' "$base" | grep -Eq '^[0-9a-f]{40}$' || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "No usable base sha '${base}', writing '*'."
+            printf '*\n' > "$out"
+          elif ! git -c "http.https://github.com/.extraheader=${auth}" fetch --no-tags --quiet --depth=1 origin "$base"; then
+            echo "::warning title=terraform-run::Could not fetch base ${base}, writing '*'."
+            printf '*\n' > "$out"
+          elif ! git -c core.quotePath=false diff --no-renames --name-only "$base" "$SHA" > "$out.tmp"; then
+            echo "::warning title=terraform-run::Could not diff ${base}..${SHA}, writing '*'."
+            rm -f "$out.tmp"
+            printf '*\n' > "$out"
+          else
+            mv "$out.tmp" "$out"
+          fi
+          echo "Changed paths:"
+          cat "$out"
+
+      - name: Build the archive
+        if: steps.resolve.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          tar --create \
+            --file=- \
+            --sort=name \
+            --mtime='@0' \
+            --owner=0 --group=0 --numeric-owner \
+            --exclude='.git' \
+            --exclude='.terraform' \
+            --exclude='*.tfstate*' \
+            --directory="$GITHUB_WORKSPACE" \
+            . \
+            | gzip -n -9 > "$RUNNER_TEMP/configuration.tar.gz"
+          ls -l "$RUNNER_TEMP/configuration.tar.gz"
+          sha256sum "$RUNNER_TEMP/configuration.tar.gz"
+
+      - name: Build the object key and metadata
+        id: object
+        if: steps.resolve.outputs.skip != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT: ${{ steps.resolve.outputs.event }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACTOR: ${{ github.actor }}
+          PUSH_REF: ${{ github.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          repo_name="${REPOSITORY#*/}"
+          key="ingest/${repo_name}/${EVENT}/${SHA}-${RUN_ID}-${RUN_ATTEMPT}.tar.gz"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            metadata="$(jq -cn \
+              --arg repo "$REPOSITORY" \
+              --arg sha "$SHA" \
+              --arg ref "$PR_HEAD_REF" \
+              --arg event "$EVENT" \
+              --arg pr "$PR_NUMBER" \
+              --arg base "$PR_BASE_SHA" \
+              --arg actor "$ACTOR" \
+              '{"repo": $repo, "sha": $sha, "ref": $ref, "event": $event, "pr-number": $pr, "base-sha": $base, "actor": $actor}')"
+          else
+            metadata="$(jq -cn \
+              --arg repo "$REPOSITORY" \
+              --arg sha "$SHA" \
+              --arg ref "$PUSH_REF" \
+              --arg event "$EVENT" \
+              --arg base "$PUSH_BEFORE" \
+              --arg actor "$ACTOR" \
+              '{"repo": $repo, "sha": $sha, "ref": $ref, "event": $event, "base-sha": $base, "actor": $actor}')"
+          fi
+          if printf '%s' "$metadata" | jq -e '[.[] | test("^[\\x20-\\x7e]*$")] | all | not' > /dev/null; then
+            echo "::error title=terraform-run::A metadata value holds characters outside printable ASCII, which S3 user metadata cannot carry. Rename the branch to ASCII."
+            exit 1
+          fi
+          {
+            echo "key=${key}"
+            echo "metadata=${metadata}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC
+        if: steps.resolve.outputs.skip != 'true'
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Upload the configuration
+        if: steps.resolve.outputs.skip != 'true'
+        env:
+          BUCKET: ${{ inputs.bucket }}
+          KEY: ${{ steps.object.outputs.key }}
+          METADATA: ${{ steps.object.outputs.metadata }}
+        run: |
+          set -euo pipefail
+          aws s3 cp "$RUNNER_TEMP/configuration.tar.gz" "s3://${BUCKET}/${KEY}" \
+            --sse aws:kms \
+            --metadata "$METADATA" \
+            --content-type application/gzip \
+            --no-progress
+          {
+            echo "### Configuration uploaded"
+            echo
+            echo "- Key: \`${KEY}\`"
+            echo "- Metadata: \`${METADATA}\`"
+            echo
+            echo "The WebbPulse-Terraform control plane picks the run up from here."
+          } >> "$GITHUB_STEP_SUMMARY"

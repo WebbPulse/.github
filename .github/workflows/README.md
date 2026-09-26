@@ -1869,6 +1869,102 @@ jobs:
 
 ---
 
+## `terraform-run.yml`
+
+The VCS bridge for the WebbPulse-Terraform control plane. On a pull request or a push it
+packs the repository at the exact commit into a tarball and uploads it to the control
+plane's ingest bucket, then exits. **It never runs Terraform and never waits for the run.**
+The control plane picks the object up and owns everything after the upload.
+
+The caller chooses which branches and paths trigger it in its own `on:` block. Only
+`pull_request` and `push` are supported; any other event fails the job with an error.
+`pull_request_target` is deliberately not supported.
+
+| Input | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `role-arn` | string | required | Role assumed through OIDC. Needs `s3:PutObject` on the ingest prefix and `kms:GenerateDataKey` on the bucket key. |
+| `bucket` | string | required | The control plane's ingest bucket. |
+| `region` | string | `us-west-2` | Region of the bucket. |
+
+Secrets: none. Outputs: none. The object key and metadata are written to the step summary.
+
+### What is uploaded
+
+The checkout is the exact commit with `fetch-depth: 1`: the pull request head sha, not
+GitHub's merge ref, for `pull_request`, and `github.sha` for `push`.
+
+Before the archive is built, the workflow writes `.webbpulse/changed-paths.txt` at the
+repository root, one repository relative path per line, from `git diff --no-renames
+--name-only <base> <sha>`. A rename lists both the old and the new path. The base is the
+pull request base sha, or `github.event.before` for a push. The other commit is fetched
+with `git fetch --depth=1`. When the base is all zeros (a new branch), is not a sha, cannot
+be fetched, or cannot be diffed, the file holds the single line `*`, meaning treat every
+path as changed. The file overwrites any `.webbpulse/changed-paths.txt` committed to the
+repository.
+
+The archive is a gzip tarball of the repository root. Entries are named `./<path>`,
+sorted, with mtime 0, owner and group 0, and no gzip name or timestamp, so the same tree
+produces the same bytes. It excludes `.git`, every `.terraform` directory at any depth,
+and anything matching `*.tfstate*`. `.terraform.lock.hcl` is kept.
+
+The object is uploaded with `aws s3 cp --sse aws:kms` to
+
+```text
+s3://<bucket>/ingest/<repo-name>/<event>/<sha>-<run_id>-<run_attempt>.tar.gz
+```
+
+where `<repo-name>` is the repository name without the owner and `<event>` is `pr` or
+`push`. A re-run gets a new `run_attempt` and so a new key.
+
+User metadata, readable as `x-amz-meta-<name>`:
+
+| Key | `pull_request` | `push` |
+| --- | --- | --- |
+| `repo` | `owner/name` | `owner/name` |
+| `sha` | head sha | `github.sha` |
+| `ref` | head branch name, for example `feature/x` | full ref, for example `refs/heads/main` |
+| `event` | `pr` | `push` |
+| `pr-number` | pull request number | absent |
+| `base-sha` | pull request base sha | `github.event.before`, all zeros for a new branch |
+| `actor` | `github.actor` | `github.actor` |
+
+### Security
+
+Branch names, the actor and every other event field are attacker influenced. The workflow
+never interpolates them into a script: they reach each step through `env:`, and the
+metadata map is built with `jq --arg`, so quoting cannot break out. S3 user metadata only
+carries printable ASCII, so a branch name outside that range fails the job with an error
+rather than being mangled.
+
+A pull request from a fork gets no OIDC token. The workflow detects that, and any other
+pull request run with no token, writes a notice and succeeds without uploading. A `push`
+run with no token fails, because it means the caller did not grant `id-token: write`.
+
+### The caller
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  terraform:
+    permissions:
+      id-token: write
+      contents: read
+    uses: WebbPulse/.github/.github/workflows/terraform-run.yml@v3
+    with:
+      role-arn: ${{ vars.TERRAFORM_INGEST_ROLE_ARN }}
+      bucket: ${{ vars.TERRAFORM_INGEST_BUCKET }}
+```
+
+The role's trust policy scopes `token.actions.githubusercontent.com:sub` to the repository,
+in the immutable subject form new repositories issue.
+
+---
+
 ## `check-runs-gate.yml`
 
 Answers one question, **are the checks on this exact commit actually green**, in a way
