@@ -9,7 +9,7 @@ Personal projects of Tyler Webb, a software engineer with a background in networ
 | [CarModPicker](https://github.com/WebbPulse/CarModPicker) | Track car modifications: manage cars, build phased part lists, log progress in forum-style threads. A companion Chrome extension captures part data from retailer pages. | [carmodpicker.com](https://www.carmodpicker.com) |
 | [WebbPulse-Portfolio](https://github.com/WebbPulse/WebbPulse-Portfolio) | Portfolio and blog. Every section is driven from the API through an admin panel rather than hardcoded. | [webbpulse.com](https://webbpulse.com) |
 
-Both are MIT licensed.
+Both are source available under the [PolyForm Strict License 1.0.0](https://polyformproject.org/licenses/strict/1.0.0). They are not open source and do not accept outside contributions.
 
 ## How things are built
 
