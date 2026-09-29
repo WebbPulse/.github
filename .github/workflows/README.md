@@ -1398,6 +1398,11 @@ as an Environment variable and the plugin reads it. A name the workflow already 
 an input or a secret is left alone, so explicit inputs still win and `E2E_USER_PASSWORD`
 remains an Environment secret. Adding a new `E2E_` name needs no change here and no new tag.
 
+**`E2E_RUN_ID` is unique per attempt.** The workflow sets `E2E_RUN_ID=<run_id>-<run_attempt>`,
+matching `e2e-local.yml`. The plugin derives ephemeral slugs from it, so a re-run gets fresh
+slugs instead of colliding with the previous attempt's resources that are still in their
+deletion grace period, which the API rejects with a 409.
+
 **Branch protection.** `e2e (staging)` is the required check for the release pull request into
 `main`. Add it, or whatever `check-name` resolves to on staging, to the required status checks
 on `main` in the product's ruleset. The staging deploy publishes that check on the commit it
