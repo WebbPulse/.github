@@ -7,7 +7,7 @@ application repository instead of copying CI and deploy steps around.
 
 **This repository is public and carries nothing estate specific.** No AWS account
 ids, no role ARNs, no bucket names, no ECR registry hostnames, no domain names, no
-CloudFront distribution ids, no HCP workspace names. Every one of those values
+CloudFront distribution ids, no workspace names. Every one of those values
 arrives from the caller as an `input` or a `secret`.
 
 Practical consequences for callers:
@@ -15,8 +15,7 @@ Practical consequences for callers:
 - Account scoped values that are not sensitive but do identify the estate (bucket
   name, distribution id, ECR repository, region) are passed as `inputs`, normally
   sourced from a GitHub Environment `vars` entry.
-- Role ARNs, the CodeArtifact domain owner account id, and the HCP token are passed
-  as `secrets`.
+- Role ARNs and the CodeArtifact domain owner account id are passed as `secrets`.
 - Use a GitHub Environment per stage so a `staging` run can never read `production`
   values. Every deploy workflow takes an `environment` input for exactly this.
 
@@ -1832,48 +1831,6 @@ so a build that cannot use the cache resolves its `FROM` exactly as it did befor
 
 ---
 
-## `terraform-speculative-plan.yml`
-
-For a pull request touching `terraform/**`. Runs `terraform fmt -check -diff`,
-`terraform init`, and `terraform validate`, and nothing else. **It posts no comment
-and produces no plan.** HCP Terraform already runs the speculative plan for the pull
-request and reports its own status. This workflow exists only to fail fast on
-formatting and configuration errors before HCP picks the run up.
-
-`terraform init` needs to reach the HCP workspace named in the caller's `cloud`
-block, so the token is exported as `TF_TOKEN_app_terraform_io`.
-
-| Input | Type | Default |
-| --- | --- | --- |
-| `working-directory` | string | `terraform` |
-| `terraform-version` | string | `1.13.1` |
-| `fmt-recursive` | boolean | `true` |
-| `runs-on` | string | `ubuntu-latest` |
-
-| Secret | Required | Notes |
-| --- | --- | --- |
-| `tf-api-token` | yes | Exported as `TF_TOKEN_app_terraform_io`. |
-
-Outputs: none.
-
-```yaml
-on:
-  pull_request:
-    paths: ["terraform/**"]
-
-jobs:
-  terraform-checks:
-    permissions:
-      contents: read
-    uses: WebbPulse/.github/.github/workflows/terraform-speculative-plan.yml@v3
-    with:
-      working-directory: terraform
-    secrets:
-      tf-api-token: ${{ secrets.TFC_API_TOKEN }}
-```
-
----
-
 ## `check-runs-gate.yml`
 
 Answers one question, **are the checks on this exact commit actually green**, in a way
@@ -2360,7 +2317,6 @@ what broke the first CI run of `webbpulse-python`.
 Setting the permissions at the top level of the caller does not work on its own
 either. A job that declares its own `permissions:` block replaces the top level
 grant rather than merging with it, so the block above belongs on each calling job.
-`terraform-speculative-plan.yml` uses no OIDC and needs only `contents: read`.
 
 **IAM permissions, per workflow**
 
@@ -2372,7 +2328,6 @@ grant rather than merging with it, so the block above belongs on each calling jo
 | `spa-deploy.yml` | `s3:ListBucket` on the bucket; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `bucket/*` (`DeleteObject` is needed by the prune pass); `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` on the distribution, only when `invalidate-cloudfront` is true |
 | `codeartifact-publish-*.yml` | `sts:GetServiceBearerToken` (on `*`), `codeartifact:GetAuthorizationToken` on the domain, and on the repository `codeartifact:PublishPackageVersion`, `codeartifact:PutPackageMetadata`, `codeartifact:ReadFromRepository`, `codeartifact:DescribePackageVersion` |
 | `python-ci.yml` / `typescript-ci.yml` | Only when the CodeArtifact login is enabled: `sts:GetServiceBearerToken`, `codeartifact:GetAuthorizationToken`, `codeartifact:ReadFromRepository`. Read only, no publish. |
-| `terraform-speculative-plan.yml` | No AWS role. It needs only the HCP token secret. |
 
 `sts:GetServiceBearerToken` is the one that is easy to miss. Without it the
 CodeArtifact login fails with an access denied that names no CodeArtifact action.
