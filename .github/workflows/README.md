@@ -1972,8 +1972,9 @@ another door.
 
 This gate counts check runs and workflow runs, which are things that actually executed. Some
 third-party integrations post a status that goes green without any run ever being queued.
-The HCP Terraform status on a pull request does exactly this, passing within seconds without
-creating a configuration version. Treat a status of that kind as unverified. It is not a
+A Terraform status on a pull request can do exactly this, passing within seconds without a
+plan having run. Confirm on the WebbPulse Terraform plane that a run exists for the head
+commit, and treat a status of that kind as unverified until then. It is not a
 substitute for this gate, and a repository that relies on one is back in failure mode 2 with
 a green tick on top.
 
