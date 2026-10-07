@@ -15,8 +15,8 @@ Both are source available under the [PolyForm Strict License 1.0.0](https://poly
 
 - **Backend:** Python 3.13, FastAPI, DynamoDB, AWS Lambda behind an HTTP API
 - **Frontend:** React, TypeScript, Vite, Tailwind CSS
-- **Infrastructure:** Terraform on HCP Terraform, one workspace per environment, OIDC into AWS with no long-lived keys
-- **Platform:** the AWS Organization, HCP Terraform workspaces, GitHub repositories, and DNS are all managed as code in private repositories
+- **Infrastructure:** Terraform on the WebbPulse Terraform plane ([terraform.webbpulse.com](https://terraform.webbpulse.com)), one workspace per environment, OIDC into AWS with no long-lived keys
+- **Platform:** the AWS Organization, Terraform workspaces, GitHub repositories, and DNS are all managed as code in private repositories
 
 ## Contact
 
