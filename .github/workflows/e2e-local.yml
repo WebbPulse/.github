@@ -151,6 +151,11 @@ on:
         type: string
         required: false
         default: "e2e (local)"
+      fail-on-suite-failure:
+        description: "When true, the job fails after publishing the check run if the suite did not succeed, so a caller's aggregator goes red. Default false keeps the job green."
+        type: boolean
+        required: false
+        default: false
       timeout-minutes:
         description: "Minutes the job may run before GitHub cancels it, so a hung run never blocks the next one."
         type: number
@@ -630,14 +635,18 @@ jobs:
             });
             core.summary.addRaw(summary).write();
 
-      - name: Report the suite outcome without failing the caller
+      - name: Report the suite outcome
         if: always()
         env:
           SUITE_OUTCOME: ${{ steps.suite.outcome }}
+          FAIL_ON_SUITE_FAILURE: ${{ inputs.fail-on-suite-failure }}
         run: |
           set -euo pipefail
           if [ "$SUITE_OUTCOME" = "success" ]; then
             echo "The suite passed. The check run reports success."
+          elif [ "$FAIL_ON_SUITE_FAILURE" = "true" ]; then
+            echo "::error::The suite concluded ${SUITE_OUTCOME}. The check run lists the failed tests; fail-on-suite-failure is set, so this job fails."
+            exit 1
           else
-            echo "::warning::The suite concluded ${SUITE_OUTCOME}. The check run reports it; this job stays green because the local suite is not a required check."
+            echo "::warning::The suite concluded ${SUITE_OUTCOME}. The check run reports it; this job stays green because fail-on-suite-failure is false."
           fi
