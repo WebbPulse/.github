@@ -4,7 +4,7 @@ Organisation level GitHub configuration for WebbPulse: the reusable workflows ev
 repository calls, a composite action, and the public organisation profile.
 
 This repository is public and holds nothing estate specific. No AWS account ids, role
-ARNs, bucket names, registry hostnames, domain names, distribution ids or HCP workspace
+ARNs, bucket names, registry hostnames, domain names, distribution ids or workspace
 names live here. Every one of those values arrives from the calling repository as an
 `input` or a `secret`.
 
@@ -50,9 +50,6 @@ One line each, pointing at the section that documents the inputs, secrets and be
   that is already published.
 - [`codeartifact-publish-npm.yml`](.github/workflows/README.md#codeartifact-publish-pythonyml-and-codeartifact-publish-npmyml)
   does the same for an npm package, reading the name and version from `package.json`.
-- [`terraform-speculative-plan.yml`](.github/workflows/README.md#terraform-speculative-planyml)
-  runs `terraform fmt -check`, `init` and `validate` on a pull request touching
-  `terraform/**`, and nothing else.
 
 ## Pinning
 
