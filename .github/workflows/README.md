@@ -1446,16 +1446,23 @@ stack needs, `SECRET_KEY` and the rest, arrives in `backend-env-json` from the c
 are local throwaway values for a stack that is destroyed with the runner, not real secrets, so
 the input appearing in the run log is the expected shape. Do not put a real secret in it.
 
-### The two rules that keep it non required
+### Non required by default, blocking on opt in
 
-- **Keep the calling job out of `all-checks-passed`'s `needs`.** That aggregator is the
-  required context in every product ruleset, so adding this job to it would make the local
-  suite required by the back door.
+By default the local suite reports without blocking:
+
 - **The job never fails the caller.** The suite step is `continue-on-error: true`, the check
   run is published with the suite's real conclusion, and the job then ends green. A red local
-  suite shows as a red `e2e (local)` check and a green job, so it reports without blocking.
-  A caller that wants the job itself to go red can set `continue-on-error` on its own side,
-  but then rule one is doing all the work.
+  suite shows as a red `e2e (local)` check and a green job.
+- **Keep the calling job out of `all-checks-passed`'s `needs`.** That aggregator is the
+  required context in every product ruleset. A caller cannot set `continue-on-error` on a job
+  that calls a reusable workflow, so the job result is the only signal the aggregator sees.
+
+A product that wants a red local suite to block its pull requests sets
+`fail-on-suite-failure: true` and adds the calling job to `all-checks-passed`'s `needs`. The
+last step then exits non-zero for any suite outcome other than success, after the check run,
+the junit report, the browser artifacts and the stack logs are published, so the job and the
+aggregator go red together with the check run. Without the input, a calling job in the
+aggregator's `needs` stays green on a red suite and the pull request looks mergeable.
 
 The check run is created through the API under `check-name`, so it is not one of the job's own
 statuses and never appears in branch protection unless someone adds it. On a `pull_request`
@@ -1492,6 +1499,7 @@ commit nobody is looking at.
 | `browser` | string | `chromium` | |
 | `headless` | boolean | `true` | |
 | `check-name` | string | `e2e (local)` | |
+| `fail-on-suite-failure` | boolean | `false` | True fails the job when the suite did not succeed. See [Non required by default, blocking on opt in](#non-required-by-default-blocking-on-opt-in). |
 | `timeout-minutes` | number | `30` | |
 | `runs-on` | string | `ubuntu-latest` | |
 
@@ -1546,7 +1554,7 @@ sees are the calling repository's and organisation's variables. A product needin
 `checks: write` must be granted on the calling job, not only inside this workflow, because a
 reusable workflow can never hold a permission its caller did not. Gate the job on the existing
 `changes` job so a docs only pull request does not pay for it, and leave it out of
-`all-checks-passed`'s `needs`.
+`all-checks-passed`'s `needs` unless `fail-on-suite-failure` is true.
 
 Two traps the products hit. `vite preview` does not proxy, so the SPA must be built with a
 full `http://` API URL rather than a bare host, and the preview origin must be allowed by the
