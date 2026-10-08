@@ -18,6 +18,14 @@ inputs:
       as does a base that cannot be resolved or is not an ancestor of head.
     required: false
     default: ""
+  base-from-event:
+    description: >-
+      `true` resolves an empty `base` from the triggering event: the pull request base
+      sha, the merge group base sha, or a push's `before`. The all-zero sha of a
+      branch's first push, and any other event, stay unknown. `false` leaves an empty
+      `base` unknown.
+    required: false
+    default: "false"
   head:
     description: "Commit sha or ref to diff to."
     required: false
@@ -62,6 +70,9 @@ outputs:
   reason:
     description: "One human readable line explaining the verdict."
     value: ${{ steps.affected.outputs.reason }}
+  base:
+    description: "The base the diff was taken from, after any event resolution. Empty when unknown."
+    value: ${{ steps.affected.outputs.base }}
 
 runs:
   using: composite
@@ -72,6 +83,7 @@ runs:
       env:
         AFFECTED_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         AFFECTED_BASE: ${{ inputs.base }}
+        AFFECTED_BASE_FROM_EVENT: ${{ inputs.base-from-event }}
         AFFECTED_HEAD: ${{ inputs.head }}
         AFFECTED_MODE: ${{ inputs.mode }}
         AFFECTED_EXTRA_FULL_PATHS: ${{ inputs.extra-full-paths }}
@@ -83,6 +95,7 @@ runs:
           --repo-root "$GITHUB_WORKSPACE" \
           --working-directory "$AFFECTED_WORKING_DIRECTORY" \
           --base "$AFFECTED_BASE" \
+          --base-from-event "$AFFECTED_BASE_FROM_EVENT" \
           --head "$AFFECTED_HEAD" \
           --mode "$AFFECTED_MODE" \
           --unattributed "$AFFECTED_UNATTRIBUTED" \

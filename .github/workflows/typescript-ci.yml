@@ -50,6 +50,20 @@ on:
         type: string
         required: false
         default: "npm test -- --run --coverage"
+      audit-level:
+        description: >-
+          Minimum severity that fails the dependency audit: low, moderate, high or
+          critical. Empty skips the audit.
+        type: string
+        required: false
+        default: ""
+      circular-imports-path:
+        description: >-
+          Path, relative to working-directory, that madge checks for circular imports
+          across .ts and .tsx files, for example "src/". Empty skips the check.
+        type: string
+        required: false
+        default: ""
       build-command:
         description: "Build command. Empty skips the build."
         type: string
@@ -200,6 +214,32 @@ jobs:
           else
             npm ci --no-progress
           fi
+
+      - name: Audit dependencies for vulnerabilities
+        if: inputs.audit-level != ''
+        env:
+          AUDIT_LEVEL: ${{ inputs.audit-level }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$AUDIT_LEVEL" in
+            low|moderate|high|critical) ;;
+            *)
+              echo "::error::audit-level must be low, moderate, high or critical, got $AUDIT_LEVEL."
+              exit 1
+              ;;
+          esac
+          if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+            pnpm audit --audit-level "$AUDIT_LEVEL"
+          else
+            npm audit --audit-level="$AUDIT_LEVEL"
+          fi
+
+      - name: Check circular imports
+        if: inputs.circular-imports-path != ''
+        env:
+          CIRCULAR_IMPORTS_PATH: ${{ inputs.circular-imports-path }}
+        run: npx --yes madge --circular --extensions ts,tsx "$CIRCULAR_IMPORTS_PATH"
 
       - name: Lint
         if: inputs.lint-command != ''
