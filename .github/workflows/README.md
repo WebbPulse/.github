@@ -250,6 +250,8 @@ a branch ruleset requires. See [Merging: auto-merge on green](#merging-auto-merg
 | `typecheck-command` | string | `npm run type-check` | Empty skips the step. |
 | `test-command` | string | `npm test -- --run --coverage` | Empty skips the step. |
 | `build-command` | string | `npm run build` | Empty skips the step. |
+| `audit-level` | string | `""` | `low`, `moderate`, `high` or `critical`: runs `npm audit --audit-level=<level>` (or `pnpm audit`) after the install. Empty skips the audit. |
+| `circular-imports-path` | string | `""` | Path under `working-directory`, for example `src/`, checked with `npx madge --circular --extensions ts,tsx`. Empty skips the check. |
 | `run-playwright` | boolean | `false` | Enables the end to end job. |
 | `playwright-command` | string | `npx playwright test` | |
 | `playwright-browsers` | string | `chromium` | Passed to `playwright install`. |
@@ -288,6 +290,8 @@ jobs:
     with:
       working-directory: frontend
       node-version: "22"
+      audit-level: moderate
+      circular-imports-path: src/
       run-playwright: true
 ```
 
@@ -1714,7 +1718,7 @@ contains an `entrypoint.py`, which is the same thing the image build means by `D
       - id: affected
         uses: WebbPulse/.github/actions/affected-domains@v3
         with:
-          base: ${{ github.event.pull_request.base.sha }}
+          base-from-event: "true"
           mode: deploy
           extra-full-paths: |
             terraform/**
@@ -1725,6 +1729,7 @@ contains an `entrypoint.py`, which is the same thing the image build means by `D
 | --- | --- | --- |
 | `working-directory` | `backend` | Directory holding the Python project. |
 | `base` | `""` | Commit sha or ref to diff from. Empty, unresolvable, or not an ancestor of `head` means **unknown**, which yields every domain. |
+| `base-from-event` | `"false"` | `"true"` resolves an empty `base` from the triggering event: `pull_request.base.sha` for `pull_request` and `pull_request_target`, `merge_group.base_sha` for `merge_group`, and `before` for `push`. The all-zero `before` of a branch's first push, and any other event, stay unknown. A `base` the caller passes always wins, and a base missing from a shallow clone is fetched as for `base`. |
 | `head` | `HEAD` | Commit sha or ref to diff to. |
 | `mode` | `ci` | `deploy` attributes only what ships in an image. `ci` also attributes the test tree and reports `shared`. |
 | `extra-full-paths` | `""` | Repo-relative globs, one per line, that force every domain. |
@@ -1737,6 +1742,7 @@ contains an `entrypoint.py`, which is the same thing the image build means by `D
 | `any` | `true` when `domains` is non-empty. |
 | `shared` | `ci` mode only: whether the shared test shard has to run. Always `false` in `deploy` mode. |
 | `reason` | One human readable line, also written to the step summary. |
+| `base` | The base the diff was taken from, after any event resolution. Empty when unknown. |
 
 ### How a path is attributed
 

@@ -33,6 +33,10 @@ NON_CODE_SUBTREES = ("tests", "e2e", "scripts", "docs")
 """Subtrees that never ship in an image, so in deploy mode they change nothing."""
 
 
+ZERO_SHA = "0" * 40
+"""What a push event reports as `before` for a branch's first push."""
+
+
 class Unknown(Exception):
     """The diff could not be computed, so every domain has to be assumed affected."""
 
@@ -90,6 +94,39 @@ def changed_paths(base, head, repo_root):
 
     output = _run(["git", "diff", "--name-only", base, head], repo_root)
     return [line for line in output.splitlines() if line.strip()]
+
+
+def event_base(event_name, event_path):
+    """The commit the triggering event's change starts from, or "" when it has none.
+
+    Reads the pull request base sha, the merge group base sha, or the push event's
+    `before`. Any other event, an unreadable payload, or the all-zero sha a
+    branch's first push reports yields "", which the caller treats as unknown.
+    """
+    if not event_path:
+        return ""
+    try:
+        with open(event_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    if event_name in ("pull_request", "pull_request_target"):
+        base = (payload.get("pull_request") or {}).get("base") or {}
+        sha = base.get("sha") if isinstance(base, dict) else None
+    elif event_name == "merge_group":
+        group = payload.get("merge_group") or {}
+        sha = group.get("base_sha") if isinstance(group, dict) else None
+    elif event_name == "push":
+        sha = payload.get("before")
+    else:
+        sha = None
+
+    if not isinstance(sha, str) or not sha.strip() or sha.strip() == ZERO_SHA:
+        return ""
+    return sha.strip()
 
 
 def discover_domains(app_dir):
@@ -505,7 +542,16 @@ def main(argv=None):
     parser.add_argument("--extra-full-paths", default="")
     parser.add_argument("--unattributed", choices=("all", "none"), default="all")
     parser.add_argument("--repo-root", default=".")
+    parser.add_argument("--base-from-event", type=str.lower, choices=("true", "false"), default="false")
     args = parser.parse_args(argv)
+
+    base = args.base
+    if not base and args.base_from_event == "true":
+        base = event_base(
+            os.environ.get("GITHUB_EVENT_NAME", ""),
+            os.environ.get("GITHUB_EVENT_PATH", ""),
+        )
+        print(f"Base from the {os.environ.get('GITHUB_EVENT_NAME') or 'unknown'} event: {base or 'none'}")
 
     repo_root = Path(args.repo_root).resolve()
     work_dir_rel = args.working_directory.strip("/") or "."
@@ -520,7 +566,7 @@ def main(argv=None):
 
     unknown_reason = ""
     try:
-        paths = changed_paths(args.base, args.head, repo_root)
+        paths = changed_paths(base, args.head, repo_root)
     except Unknown as error:
         unknown_reason = str(error)
         paths = []
@@ -578,6 +624,7 @@ def main(argv=None):
         "any": str(bool(ordered)).lower(),
         "shared": str(bool(shared)).lower(),
         "reason": reason,
+        "base": base,
     }
 
     summary = render_summary(attribution, reason, ordered, all_flag, shared, args.mode)

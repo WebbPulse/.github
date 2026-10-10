@@ -178,6 +178,13 @@ def run(root, base, head, **kwargs):
     ]
     summary = root / "summary.md"
     env = {"GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}
+    if "event" in kwargs:
+        event_name, payload = kwargs["event"]
+        event_path = root.parent / "event.json"
+        event_path.write_text(json.dumps(payload), encoding="utf-8")
+        argv += ["--base-from-event", kwargs.get("base_from_event", "true")]
+        env["GITHUB_EVENT_NAME"] = event_name
+        env["GITHUB_EVENT_PATH"] = str(event_path)
     previous = {}
     for key, value in env.items():
         previous[key] = os.environ.get(key)
@@ -521,3 +528,79 @@ def test_a_type_checking_import_does_not_pull_in_a_domain(repo):
     base, head = commit(repo, {"backend/app/common/orphan.py": "UNUSED = 1\n"})
     result = run(repo, base, head, mode="deploy", unattributed="none")
     assert json.loads(result["domains"]) == []
+
+
+def write_event(tmp_path, payload):
+    """Write an event payload and return its path."""
+    path = tmp_path / "payload.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("event_name", "payload", "expected"),
+    [
+        ("pull_request", {"pull_request": {"base": {"sha": "a" * 40}}}, "a" * 40),
+        ("pull_request_target", {"pull_request": {"base": {"sha": "b" * 40}}}, "b" * 40),
+        ("merge_group", {"merge_group": {"base_sha": "c" * 40, "head_sha": "d" * 40}}, "c" * 40),
+        ("push", {"before": "e" * 40, "after": "f" * 40}, "e" * 40),
+        ("push", {"before": "0" * 40}, ""),
+        ("push", {}, ""),
+        ("pull_request", {"pull_request": None}, ""),
+        ("merge_group", {"merge_group": "nonsense"}, ""),
+        ("workflow_dispatch", {"before": "e" * 40}, ""),
+    ],
+)
+def test_event_base_reads_each_event(tmp_path, event_name, payload, expected):
+    """Each event names its base in a different place, and the zero sha is unknown."""
+    assert affected_domains.event_base(event_name, write_event(tmp_path, payload)) == expected
+
+
+def test_event_base_without_a_readable_payload_is_unknown(tmp_path):
+    """A missing or malformed payload falls back to unknown rather than failing."""
+    assert affected_domains.event_base("push", "") == ""
+    assert affected_domains.event_base("push", str(tmp_path / "missing.json")) == ""
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert affected_domains.event_base("push", str(broken)) == ""
+    assert affected_domains.event_base("push", write_event(tmp_path, ["list"])) == ""
+
+
+def test_a_push_event_base_narrows_the_diff(repo):
+    """With base-from-event, an empty base resolves to the push's before sha."""
+    base, head = commit(repo, {"backend/app/domains/alpha/router.py": "ROUTES = [5]\n"})
+    result = run(repo, "", head, mode="deploy", event=("push", {"before": base}))
+    assert json.loads(result["domains"]) == ["alpha"]
+    assert result["base"] == base
+
+
+def test_a_merge_group_event_base_narrows_the_diff(repo):
+    """A merge group names its base as base_sha."""
+    base, head = commit(repo, {"backend/app/domains/beta/router.py": "ROUTES = [6]\n"})
+    result = run(repo, "", head, mode="deploy", event=("merge_group", {"merge_group": {"base_sha": base}}))
+    assert json.loads(result["domains"]) == ["beta"]
+    assert result["base"] == base
+
+
+def test_a_first_push_stays_unknown(repo):
+    """The zero sha of a branch's first push yields every domain."""
+    head = git(repo, "rev-parse", "HEAD")
+    result = run(repo, "", head, mode="deploy", event=("push", {"before": "0" * 40}))
+    assert result["all"] == "true"
+    assert result["base"] == ""
+
+
+def test_an_explicit_base_wins_over_the_event(repo):
+    """A caller's base is used as given, whatever the event says."""
+    base, head = commit(repo, {"backend/app/domains/alpha/router.py": "ROUTES = [7]\n"})
+    result = run(repo, base, head, mode="deploy", event=("push", {"before": "0" * 40}))
+    assert json.loads(result["domains"]) == ["alpha"]
+    assert result["base"] == base
+
+
+def test_the_event_is_ignored_unless_asked(repo):
+    """The default keeps an empty base unknown, as before the input existed."""
+    base, head = commit(repo, {"backend/app/domains/alpha/router.py": "ROUTES = [8]\n"})
+    result = run(repo, "", head, mode="deploy", event=("push", {"before": base}), base_from_event="false")
+    assert result["all"] == "true"
+    assert result["base"] == ""
