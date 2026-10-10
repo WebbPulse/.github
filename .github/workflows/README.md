@@ -1845,6 +1845,51 @@ so a build that cannot use the cache resolves its `FROM` exactly as it did befor
 
 ---
 
+## `actions/webbpulse-dependency-stamp`
+
+A composite action that resolves the value a backend image build stamps into its
+`DEPENDENCY_RESOLUTION` build argument, for a product deploy workflow that builds its
+images itself rather than through [`lambda-domains-deploy.yml`](#lambda-domains-deployyml).
+It replaces the "Resolve the dependency resolution stamp" step those workflows each
+carried a copy of.
+
+```yaml
+      - name: Configure AWS credentials via OIDC
+        if: inputs.fresh-dependencies != true
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ steps.values.outputs.role-arn }}
+          aws-region: us-west-2
+
+      - id: stamp
+        uses: WebbPulse/.github/actions/webbpulse-dependency-stamp@v3
+        with:
+          fresh-dependencies: ${{ inputs.fresh-dependencies }}
+          domain-owner: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `fresh-dependencies` | `"false"` | `"true"` stamps `run-id`, so the dependency layer rebuilds. No AWS call is made. |
+| `run-id` | `${{ github.run_id }}` | The stamp on a fresh-dependencies run. |
+| `domain-owner` | `""` | Account id owning the CodeArtifact domain. Required unless `fresh-dependencies` is `"true"`. |
+| `package` | `webbpulse` | Package whose newest Published version is the stamp. Always the `pypi` format. |
+| `repository` | `python` | CodeArtifact repository holding the package. |
+| `domain` | `webbpulse` | CodeArtifact domain holding the repository. |
+
+| Output | Notes |
+| --- | --- |
+| `dependency-stamp` | The run id on a fresh-dependencies run, otherwise the newest Published version. |
+
+The caller configures AWS credentials that may call `codeartifact:ListPackageVersions`.
+The lookup runs `list-package-versions --sort-by PUBLISHED_TIME --query
+'versions[0].version' --output text --no-paginate`. Pagination is off because the CLI
+applies `--query` to every page, so once the version list spans two pages a paginated
+call writes one line per page and the step output breaks with `Invalid format`. The step
+fails when the reply is empty, is `None`, or holds more than one line.
+
+---
+
 ## `check-runs-gate.yml`
 
 Answers one question, **are the checks on this exact commit actually green**, in a way
@@ -2225,7 +2270,7 @@ uses: WebbPulse/.github/.github/workflows/python-ci.yml@<40 char sha> # v3.0.0
 ```
 
 Both forms are fine. `v3` is the moving major for every workflow in this repository and
-for the composite action, so `@v3` is what a caller pins. `v2` and `v1` are frozen and no
+for the composite actions, so `@v3` is what a caller pins. `v2` and `v1` are frozen and no
 longer move. Pin a SHA where a repository needs a change to this repository to be an
 explicit, reviewed event.
 

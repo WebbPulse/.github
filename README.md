@@ -1,7 +1,7 @@
 # WebbPulse/.github
 
 Organisation level GitHub configuration for WebbPulse: the reusable workflows every
-repository calls, a composite action, and the public organisation profile.
+repository calls, composite actions, and the public organisation profile.
 
 This repository is public and holds nothing estate specific. No AWS account ids, role
 ARNs, bucket names, registry hostnames, domain names, distribution ids or workspace
@@ -17,9 +17,12 @@ names live here. Every one of those values arrives from the calling repository a
 - **`actions/`** contains composite actions:
   [`actions/affected-domains`](actions/affected-domains/action.yml), which works out which
   backend domains a diff affects so CI shards and deploys run only for the domains whose
-  code changed; and
+  code changed;
   [`actions/base-image-cache`](actions/base-image-cache/action.yml), which resolves and
-  caches a Dockerfile's base image so a build matrix pulls it once.
+  caches a Dockerfile's base image so a build matrix pulls it once; and
+  [`actions/webbpulse-dependency-stamp`](actions/webbpulse-dependency-stamp/action.yml),
+  which resolves the `DEPENDENCY_RESOLUTION` stamp from the newest published webbpulse
+  version, or the run id on a fresh-dependencies run.
 - **`profile/README.md`** is the organisation profile rendered on the WebbPulse GitHub
   organisation page.
 
