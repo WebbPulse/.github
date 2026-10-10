@@ -1489,6 +1489,7 @@ commit nobody is looking at.
 | `aws-region` | string | `us-west-2` | For the CodeArtifact token. The stack calls no AWS API. |
 | `node-version` | string | `22` | |
 | `frontend-directory` | string | `frontend` | Holds `package.json` and `package-lock.json`. |
+| `frontend-install-command` | string | `""` | Run in `frontend-directory`. Empty means `npm ci`, then `npm update` of every `@webbpulse/*` dependency in `package.json`, so the PR build floats to the newest shared packages like the product CI and deploys do. The update is skipped when there are none. |
 | `frontend-build-command` | string | `npm run build` | Run in `frontend-directory`. |
 | `frontend-build-env-json` | string | `{}` | Exported before the build, for the Vite variable carrying the local API base URL. |
 | `preview-command` | string | `npx vite preview --host 127.0.0.1 --port 4173` | Backgrounded in `frontend-directory`. |
