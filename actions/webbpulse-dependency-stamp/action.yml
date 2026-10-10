@@ -1,0 +1,57 @@
+name: WebbPulse dependency stamp
+description: >-
+  Resolves the value a backend image build stamps into its DEPENDENCY_RESOLUTION build
+  argument, so the dependency layer is rebuilt exactly when a newer shared package is
+  published. A fresh-dependencies run stamps the run id, so the layer always rebuilds.
+  Otherwise the newest Published version of the package is read out of CodeArtifact with
+  pagination off, and the step fails when nothing resolves or more than one line comes
+  back. AWS credentials are configured by the caller.
+
+inputs:
+  fresh-dependencies:
+    description: "`true` stamps the run id instead of the newest published version, so the layer rebuilds."
+    required: false
+    default: "false"
+  run-id:
+    description: "The value stamped on a fresh-dependencies run."
+    required: false
+    default: ${{ github.run_id }}
+  domain-owner:
+    description: >-
+      Account id owning the CodeArtifact domain. Required unless fresh-dependencies is
+      `true`.
+    required: false
+    default: ""
+  package:
+    description: "CodeArtifact package whose newest Published version is the stamp."
+    required: false
+    default: "webbpulse"
+  repository:
+    description: "CodeArtifact repository holding the package."
+    required: false
+    default: "python"
+  domain:
+    description: "CodeArtifact domain holding the repository."
+    required: false
+    default: "webbpulse"
+
+outputs:
+  dependency-stamp:
+    description: "The run id on a fresh-dependencies run, otherwise the newest Published package version."
+    value: ${{ steps.stamp.outputs.dependency-stamp }}
+
+runs:
+  using: composite
+  steps:
+    - id: stamp
+      name: Resolve the dependency resolution stamp
+      shell: bash
+      env:
+        STAMP_FRESH_DEPENDENCIES: ${{ inputs.fresh-dependencies }}
+        STAMP_RUN_ID: ${{ inputs.run-id }}
+        STAMP_DOMAIN_OWNER: ${{ inputs.domain-owner }}
+        STAMP_PACKAGE: ${{ inputs.package }}
+        STAMP_REPOSITORY: ${{ inputs.repository }}
+        STAMP_DOMAIN: ${{ inputs.domain }}
+        STAMP_SCRIPT: ${{ github.action_path }}/resolve_stamp.sh
+      run: bash "$STAMP_SCRIPT"

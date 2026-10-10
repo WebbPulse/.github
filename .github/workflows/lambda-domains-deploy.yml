@@ -392,7 +392,14 @@ jobs:
               --status Published \
               --sort-by PUBLISHED_TIME \
               --query 'versions[0].version' \
-              --output text)"
+              --output text \
+              --no-paginate)"
+            LINES="$(printf '%s\n' "$STAMP" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+            if [ "$LINES" -gt 1 ]; then
+              echo "::error::CodeArtifact returned ${LINES} lines for the newest ${DEPENDENCY_PACKAGE} version, so the dependency layer cannot be keyed."
+              exit 1
+            fi
+            STAMP="$(printf '%s\n' "$STAMP" | tr -d '[:space:]')"
             if [ -z "$STAMP" ] || [ "$STAMP" = "None" ]; then
               echo "::error::No Published ${DEPENDENCY_PACKAGE} version resolved, so the dependency layer cannot be keyed."
               exit 1
