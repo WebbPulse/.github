@@ -637,6 +637,8 @@ runs `update-function-code --image-uri`, waits again with `function-updated-v2`
 (container image functions stay `Pending` while Lambda optimizes the image), then
 optionally probes a smoke URL with retries.
 
+**AWS calls retry adaptively.** The workflow sets `AWS_RETRY_MODE=adaptive` and `AWS_MAX_ATTEMPTS=10`, so Lambda control plane throttling (`TooManyRequestsException`) backs off client side instead of failing the job after the CLI default of 2 retries.
+
 **Every function updates concurrently.** The per function work runs in the background
 inside the one job, so a fleet takes about as long as its slowest function instead of
 the sum of all of them. Almost all of the roughly ten seconds a function takes is
@@ -710,6 +712,8 @@ each carrying a private copy of, hoisted verbatim: resolve the environment, work
 affected domains, warm the base image cache, build the images, assemble the function image
 map, drop the functions that do not exist yet, point each function at its new image, and
 smoke test each one.
+
+**AWS calls retry adaptively.** The workflow sets `AWS_RETRY_MODE=adaptive` and `AWS_MAX_ATTEMPTS=10`, so Lambda control plane throttling (`TooManyRequestsException`) backs off client side instead of failing the job after the CLI default of 2 retries.
 
 It composes [`base-image-cache.yml`](#base-image-cacheyml),
 [`container-image.yml`](#container-imageyml) and

@@ -251,6 +251,10 @@ on:
 
 permissions: {}
 
+env:
+  AWS_RETRY_MODE: adaptive
+  AWS_MAX_ATTEMPTS: "10"
+
 jobs:
   resolve-env:
     name: Resolve deploy environment
