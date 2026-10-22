@@ -77,6 +77,10 @@ concurrency:
   group: ${{ inputs.concurrency-group != '' && inputs.concurrency-group || format('lambda-image-deploy-{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: false
 
+env:
+  AWS_RETRY_MODE: adaptive
+  AWS_MAX_ATTEMPTS: "10"
+
 jobs:
   deploy:
     name: Deploy the function image
