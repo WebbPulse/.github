@@ -230,10 +230,33 @@ jobs:
               ;;
           esac
           if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
-            pnpm audit --audit-level "$AUDIT_LEVEL"
+            audit_cmd=(pnpm audit --audit-level "$AUDIT_LEVEL")
           else
-            npm audit --audit-level="$AUDIT_LEVEL"
+            audit_cmd=(npm audit --audit-level="$AUDIT_LEVEL")
           fi
+          outage='(audit|responded with) 5[0-9][0-9]|ENOTFOUND|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up'
+          report='npm audit report|vulnerabilities found|[0-9]+ (low|moderate|high|critical)'
+          log="$RUNNER_TEMP/audit.log"
+          attempts=4
+          delay=10
+          for attempt in $(seq 1 "$attempts"); do
+            set +e
+            "${audit_cmd[@]}" 2>&1 | tee "$log"
+            status=${PIPESTATUS[0]}
+            set -e
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if grep -qiE "$report" "$log" || ! grep -qE "$outage" "$log"; then
+              exit "$status"
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              echo "Audit registry unavailable on attempt $attempt of $attempts, retrying in ${delay}s."
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::warning::Dependency audit skipped: the registry audit endpoint was unavailable after $attempts attempts."
 
       - name: Check circular imports
         if: inputs.circular-imports-path != ''
