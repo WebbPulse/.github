@@ -203,6 +203,8 @@ jobs:
 
       - name: Install dependencies
         env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
           INSTALL_COMMAND: ${{ inputs.install-command }}
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
@@ -326,6 +328,8 @@ jobs:
 
       - name: Install dependencies
         env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
           INSTALL_COMMAND: ${{ inputs.install-command }}
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
