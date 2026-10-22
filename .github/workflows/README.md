@@ -1081,6 +1081,15 @@ Three passes, in this order, so a deploy is never briefly broken:
    previous asset sets are present, so no request can miss.
 3. **Prune**, `--delete` over the whole tree with no filters.
 
+Between passes two and three, `.well-known/apple-app-site-association`, when the build
+output has one, is uploaded on its own with `Content-Type: application/json` and the
+entry file cache header. Pass two excludes it, because `aws s3 sync` guesses
+`binary/octet-stream` for a file with no extension and Apple requires JSON. Pass three
+finds the object already current and leaves it alone, and still deletes it once a build
+stops shipping the file. A build without it skips the step. The `spa-frontend` module
+from v2.42.0 serves `/.well-known/` without the SPA rewrite, so the two together publish
+the file for iOS universal links and passkeys.
+
 Pass three is separate on purpose. The AWS CLI documents `--delete` as "Files that
 exist in the destination but not in the source are deleted during sync. Note that
 files excluded by filters are excluded from deletion." A `--delete` carried on either

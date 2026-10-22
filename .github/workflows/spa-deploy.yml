@@ -297,6 +297,31 @@ jobs:
           aws s3 sync "${OUTPUT_DIR}/" "$DESTINATION" \
             --no-progress \
             "${EXCLUDES[@]}" \
+            --exclude ".well-known/apple-app-site-association" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Upload the apple-app-site-association file as JSON
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          S3_BUCKET: ${{ inputs.s3-bucket }}
+          S3_PREFIX: ${{ inputs.s3-prefix }}
+          OUTPUT_DIR: ${{ inputs.build-output-directory }}
+        run: |
+          set -euo pipefail
+          SOURCE="${OUTPUT_DIR}/.well-known/apple-app-site-association"
+          if [ ! -f "$SOURCE" ]; then
+            echo "No .well-known/apple-app-site-association in the build output."
+            exit 0
+          fi
+          DESTINATION="s3://${S3_BUCKET}"
+          if [ -n "$S3_PREFIX" ]; then
+            DESTINATION="${DESTINATION}/${S3_PREFIX#/}"
+          fi
+          DESTINATION="${DESTINATION%/}/.well-known/apple-app-site-association"
+
+          aws s3 cp "$SOURCE" "$DESTINATION" \
+            --no-progress \
+            --content-type "application/json" \
             --cache-control "no-cache, no-store, must-revalidate"
 
       - name: Prune objects from earlier builds
