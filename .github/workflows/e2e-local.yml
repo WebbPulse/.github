@@ -418,6 +418,8 @@ jobs:
       - name: Install the frontend dependencies
         working-directory: ${{ inputs.frontend-directory }}
         env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
           FRONTEND_INSTALL_COMMAND: ${{ inputs.frontend-install-command }}
         run: |
           set -euo pipefail

@@ -213,6 +213,8 @@ jobs:
       - name: Install dependencies
         if: steps.exists.outputs.exists != 'true'
         env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
           INSTALL_COMMAND: ${{ inputs.install-command }}
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
