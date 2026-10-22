@@ -236,7 +236,7 @@ jobs:
           else
             audit_cmd=(npm audit --audit-level="$AUDIT_LEVEL")
           fi
-          outage='(audit|responded with) 5[0-9][0-9]|ENOTFOUND|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up'
+          outage='(audit|responded with) 5[0-9][0-9]|audit 400 Bad Request - POST [^ ]*/audits/quick|ENOTFOUND|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up'
           report='npm audit report|vulnerabilities found|[0-9]+ (low|moderate|high|critical)'
           log="$RUNNER_TEMP/audit.log"
           attempts=4
