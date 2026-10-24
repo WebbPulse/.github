@@ -351,6 +351,27 @@ registry, so the workflow resolves the caller's own registry host from
 `sts get-caller-identity` plus `aws-region` instead of reading that output. The push
 target is unchanged either way: the caller's own account.
 
+**Why `ecr-public-login` exists.** A `FROM` on `public.ecr.aws` with no credential
+pulls anonymously, and the anonymous quota is counted per source IP. Shared GitHub
+hosted runner IPs exhaust it, and the pull then fails with a 429 `Data limit
+exceeded`. With `ecr-public-login: true` the workflow runs
+`aws ecr-public get-login-password --region us-east-1` against the assumed role and
+pipes it into `docker login public.ecr.aws`, after the ECR login and before any base
+image pull or build, so both `skopeo` and BuildKit pull with the account's
+authenticated quota. ECR Public authentication only exists in `us-east-1`, whatever
+`aws-region` says. The role needs `ecr-public:GetAuthorizationToken` and
+`sts:GetServiceBearerToken`, both on `Resource: "*"`:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"],
+  "Resource": "*"
+}
+```
+
+Left at `false` no login runs and the workflow behaves exactly as before.
+
 **Why the existing tag guard.** ECR repositories in this estate are created with
 `IMMUTABLE` tags and the default tag is `sha-<full git sha>`, so re-running a green
 commit pushes a tag that already exists. If the rebuild is byte identical ECR treats
@@ -439,6 +460,7 @@ a single directory, and assembles the `function-image-map` that
 | `codeartifact-repository` | string | `""` | Required when `codeartifact-domain` is set. |
 | `codeartifact-secret-id` | string | `codeartifact_token` | BuildKit secret id the Dockerfile mounts. |
 | `additional-ecr-registries` | string | `""` | Comma or newline separated account ids. The caller's own is always included. |
+| `ecr-public-login` | boolean | `false` | Log in to `public.ecr.aws` with the assumed role before the build. Needs `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` on `*`. |
 | `image-tag-suffix` | string | `""` | Appended to the tag as `sha-<full git sha>-<suffix>`. Empty keeps the plain `sha-<full git sha>`. Must match `[A-Za-z0-9_.-]+`. |
 | `skip-if-tag-exists` | boolean | `true` | Skip the build when the tag already resolves, and emit the existing digest. |
 | `upload-manifest-artifact` | boolean | `false` | Upload the per leg JSON manifest. |
@@ -605,6 +627,7 @@ change: one job block plus one `needs` entry.
 | `working-directory` | `""` | Directory the dockerfile path resolves against. Empty means the workspace root. |
 | `platform` | `linux/arm64` | Must match what the matrix passes, since the key covers the platform. |
 | `additional-ecr-registries` | `""` | Further registry account ids to log in to. The caller's own account is always included. |
+| `ecr-public-login` | `false` | Log in to `public.ecr.aws` with the assumed role before the pull, for an ECR Public base image. Needs `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` on `*`. |
 | `environment` | `""` | GitHub Environment to bind the job to. |
 | `runs-on` | `ubuntu-latest` | Runner label. |
 
@@ -1888,6 +1911,7 @@ build matrix, and the two can never drift apart.
 | `role-to-assume` | `""` | Role assumed via OIDC. Empty skips the credentials step. |
 | `ecr-registries` | `""` | Further registry account ids for the login. The caller's own account is always included. |
 | `skip-login` | `false` | `true` leaves the credentials and the ECR login to the caller, which is how `container-image.yml` calls it. |
+| `ecr-public-login` | `false` | `true` logs in to `public.ecr.aws` with the assumed role before the pull. Ignored with `skip-login`. Needs `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` on `*`. |
 
 | Output | Notes |
 | --- | --- |
@@ -2440,8 +2464,8 @@ grant rather than merging with it, so the block above belongs on each calling jo
 
 | Workflow | Actions the role needs |
 | --- | --- |
-| `base-image-cache.yml` | `ecr:GetAuthorizationToken` (on `*`), plus `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on the base image repository. Read only, no push. |
-| `container-image.yml` | `ecr:GetAuthorizationToken` (on `*`), plus on the repository: `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`, `ecr:BatchGetImage` (the manifest assertion) |
+| `base-image-cache.yml` | `ecr:GetAuthorizationToken` (on `*`), plus `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on the base image repository. Read only, no push. With `ecr-public-login`, also `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` (both on `*`). |
+| `container-image.yml` | `ecr:GetAuthorizationToken` (on `*`), plus on the repository: `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`, `ecr:BatchGetImage` (the manifest assertion). With `ecr-public-login`, also `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` (both on `*`). |
 | `lambda-image-deploy.yml` | `lambda:UpdateFunctionCode`, `lambda:GetFunction` (the waiter polls it), and `lambda:PublishVersion` when `publish-version` is true |
 | `spa-deploy.yml` | `s3:ListBucket` on the bucket; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `bucket/*` (`DeleteObject` is needed by the prune pass); `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` on the distribution, only when `invalidate-cloudfront` is true |
 | `codeartifact-publish-*.yml` | `sts:GetServiceBearerToken` (on `*`), `codeartifact:GetAuthorizationToken` on the domain, and on the repository `codeartifact:PublishPackageVersion`, `codeartifact:PutPackageMetadata`, `codeartifact:ReadFromRepository`, `codeartifact:DescribePackageVersion` |
