@@ -144,6 +144,32 @@ on:
         type: number
         required: false
         default: 8001
+      floci-image:
+        description: >-
+          floci image started next to DynamoDB Local for the AWS services DynamoDB Local does not
+          cover, such as S3 and SES. Empty, the default, skips floci entirely and leaves the
+          stack unchanged. Pin an exact release tag such as `floci/floci:2.2.0`; the workflow
+          refuses a missing tag and any `latest` or `nightly` tag. Point the backend at it
+          through `backend-env-json`, for example `AWS_ENDPOINT_URL_S3`.
+        type: string
+        required: false
+        default: ""
+      floci-port:
+        description: >-
+          Host port floci is published on, bound to 127.0.0.1. The workflow also sets
+          FLOCI_BASE_URL to `http://127.0.0.1:<floci-port>` so presigned URLs point at it.
+        type: number
+        required: false
+        default: 4566
+      floci-services:
+        description: >-
+          JSON object of floci service settings passed to the container as environment
+          variables, for example `{"FLOCI_SERVICES_SQS_ENABLED": "false"}`. Every key must start
+          with FLOCI_SERVICES_. Use it to switch off services the stack does not need. Ignored
+          when floci-image is empty.
+        type: string
+        required: false
+        default: "{}"
       browser:
         description: "Playwright browser the suite drives, chromium, firefox or webkit."
         type: string
@@ -244,6 +270,55 @@ jobs:
                   forwarded.append(key)
           print("Forwarded: " + (", ".join(forwarded) or "(none)"))
           print("Already resolved by the workflow, left alone: " + (", ".join(skipped) or "(none)"))
+          PY
+
+      - name: Start floci
+        if: inputs.floci-image != ''
+        env:
+          FLOCI_IMAGE: ${{ inputs.floci-image }}
+          FLOCI_PORT: ${{ inputs.floci-port }}
+          FLOCI_SERVICES_JSON: ${{ inputs.floci-services }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          image = os.environ["FLOCI_IMAGE"]
+          port = os.environ["FLOCI_PORT"]
+          reference = image.rsplit("/", 1)[-1]
+          if "@" not in reference:
+              tag = reference.split(":", 1)[1] if ":" in reference else ""
+              if not tag or tag.startswith(("latest", "nightly")):
+                  print(f"::error::floci-image must pin an exact release tag such as floci/floci:2.2.0, got {image}.")
+                  sys.exit(1)
+          try:
+              services = json.loads(os.environ["FLOCI_SERVICES_JSON"] or "{}")
+          except json.JSONDecodeError as error:
+              print(f"::error::floci-services is not valid JSON: {error}.")
+              sys.exit(1)
+          if not isinstance(services, dict):
+              print("::error::floci-services must be a JSON object of FLOCI_SERVICES_ names to values.")
+              sys.exit(1)
+          invalid = sorted(key for key in services if not re.fullmatch(r"FLOCI_SERVICES_[A-Z0-9_]+", key))
+          if invalid:
+              print("::error::floci-services keys must start with FLOCI_SERVICES_, got: " + ", ".join(invalid) + ".")
+              sys.exit(1)
+          command = [
+              "docker", "run", "-d", "--name", "floci",
+              "-p", f"127.0.0.1:{port}:4566",
+              "-e", f"FLOCI_BASE_URL=http://127.0.0.1:{port}",
+          ]
+          for key in sorted(services):
+              value = services[key]
+              if isinstance(value, bool):
+                  value = "true" if value else "false"
+              command += ["-e", f"{key}={value}"]
+          command.append(image)
+          subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+          print(f"Started floci from {image} on 127.0.0.1:{port} with: " + (", ".join(sorted(services)) or "(image defaults)"))
           PY
 
       - name: Check out the repository
@@ -380,6 +455,23 @@ jobs:
             sleep 1
           done
           echo "::error::DynamoDB Local did not answer on ${DYNAMODB_URL} within 60 seconds."
+          exit 1
+
+      - name: Wait for floci to answer
+        if: inputs.floci-image != ''
+        env:
+          FLOCI_HEALTH_URL: http://127.0.0.1:${{ inputs.floci-port }}/_floci/health
+        run: |
+          set -euo pipefail
+          for ATTEMPT in $(seq 1 60); do
+            if curl -sf -o /dev/null "$FLOCI_HEALTH_URL"; then
+              echo "floci answered on ${FLOCI_HEALTH_URL} after ${ATTEMPT}s."
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs --tail 50 floci || true
+          echo "::error::floci did not answer on ${FLOCI_HEALTH_URL} within 60 seconds."
           exit 1
 
       - name: Create the DynamoDB Local tables
@@ -543,6 +635,11 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Collect the floci log
+        if: always() && inputs.floci-image != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: docker logs floci > floci.log 2>&1 || true
+
       - name: Upload the stack logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -550,6 +647,7 @@ jobs:
           name: e2e-local-logs
           path: |
             ${{ inputs.working-directory }}/backend.log
+            ${{ inputs.working-directory }}/floci.log
             ${{ inputs.frontend-directory }}/preview.log
           retention-days: 7
           if-no-files-found: ignore
@@ -559,6 +657,7 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           SUITE_OUTCOME: ${{ steps.suite.outcome }}
+          FLOCI_IMAGE: ${{ inputs.floci-image }}
         with:
           script: |
             const fs = require("fs");
@@ -627,7 +726,11 @@ jobs:
             lines.push("");
             lines.push(`Suite: ${suiteOutcome}. Mode: ${mode}.`);
             lines.push("");
-            lines.push("A local run drives a stack built from source on the runner: one composed FastAPI app, DynamoDB Local and a vite preview server. It asserts reachability, identity, frontend and browser behaviour. Route cut, coverage against the live gateway, the authorizer, the access gate, per domain isolation and the stream consumers are gateway concerns and stay in the post deploy run.");
+            const flociImage = process.env.FLOCI_IMAGE || "";
+            const stack = flociImage
+              ? `one composed FastAPI app, DynamoDB Local, floci (\`${flociImage}\`) and a vite preview server`
+              : "one composed FastAPI app, DynamoDB Local and a vite preview server";
+            lines.push(`A local run drives a stack built from source on the runner: ${stack}. It asserts reachability, identity, frontend and browser behaviour. Route cut, coverage against the live gateway, the authorizer, the access gate, per domain isolation and the stream consumers are gateway concerns and stay in the post deploy run.`);
             lines.push("");
 
             if (xml === null) {
