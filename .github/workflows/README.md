@@ -1263,7 +1263,7 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | --- | --- | --- | --- |
 | `environment` | string | `""` | `staging` or `production`. Empty derives it from the deployed branch. |
 | `sha` | string | `""` | Commit the check run lands on. Empty lets the gate resolve it. |
-| `deploy-workflows` | string | `""` | Comma separated deploy workflow names, in ownership order. Empty disables the sibling wait. |
+| `deploy-workflows` | string | `""` | Comma separated deploy workflow names. The one whose successful run finished last owns the suite; list order breaks a tie. Empty disables the sibling wait. |
 | `production-branch` | string | `main` | Branch whose deploys mean production. |
 | `read-only-environments` | string | `production` | Comma separated environments that run read only. Sets `E2E_READ_ONLY`. |
 | `api-base-url` | string | `""` | Empty reads `vars.E2E_API_BASE_URL`. |
@@ -1348,8 +1348,8 @@ jobs:
       E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
 ```
 
-`deploy-workflows` must list the same workflow names as the `workflow_run` trigger, in
-ownership order. `actions: read` is what lets the gate poll sibling runs, and `checks: write`
+`deploy-workflows` must list the same workflow names as the `workflow_run` trigger. List
+order only breaks a tie between deploys that finished in the same second. `actions: read` is what lets the gate poll sibling runs, and `checks: write`
 must be granted on the calling job, not only inside this workflow, because a reusable workflow
 can never hold a permission its caller did not.
 
@@ -1388,9 +1388,20 @@ environment it targets.
   30 minutes. A name with **no run on the commit** was path filtered and is ignored. A name
   still running is waited for. A name that completed **without** success skips the suite,
   since there is nothing sound to verify.
-- Ownership is deterministic: the **first** name in `deploy-workflows` order that has a run on
-  the commit owns the suite. Every other triggering workflow yields, so two green deploys on
-  one commit produce exactly one suite run rather than two.
+- Ownership is deterministic: once every name is green, the deploy whose latest successful
+  run finished **last** (the run's `updated_at`) owns the suite, and list order breaks a tie.
+  Only the e2e run triggered by that exact run id and attempt runs the suite; every other
+  triggering run yields, so two green deploys on one commit produce exactly one suite run
+  rather than two.
+- A deploy that failed and is re-run to green is therefore the last to turn green, so its own
+  e2e run owns the suite. The earlier gates had already skipped on the failure, so the commit
+  still gets exactly one suite. Earlier releases let the first listed deploy always own the suite,
+  and a re-run of any other deploy yielded to a gate that had already skipped, leaving the
+  commit unverified.
+- The gate does not look for an earlier e2e run that ran the suite instead. A `workflow_run`
+  run carries the default branch head as its `head_sha`, not the deployed commit, so staging
+  e2e runs cannot be found by commit, and two gates evaluating at the same moment would both
+  see no suite yet and both run it.
 
 ### Waiting on Terraform runs
 

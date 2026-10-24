@@ -20,10 +20,12 @@ on:
         default: ""
       deploy-workflows:
         description: >-
-          Comma separated names of the caller's deploy workflows, in ownership order, for
-          example "Deploy Backend, Frontend Deploy". The first name with a run on the
-          deployed commit owns the suite; the others are waited for and then yield. Empty
-          disables the sibling wait and every workflow_run trigger owns its own suite.
+          Comma separated names of the caller's deploy workflows, for example "Deploy
+          Backend, Frontend Deploy". Every name with a run on the deployed commit is waited
+          for. Once all are green, the deploy whose successful run finished last owns the
+          suite and the others yield, so a deploy re-run to green still gets its suite. List
+          order breaks a tie. Empty disables the sibling wait and every workflow_run trigger
+          owns its own suite.
         type: string
         required: false
         default: ""
@@ -258,6 +260,8 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           THIS_WORKFLOW: ${{ github.event.workflow_run.name }}
+          THIS_RUN_ID: ${{ github.event.workflow_run.id }}
+          THIS_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           DEPLOY_WORKFLOWS: ${{ inputs.deploy-workflows }}
           PRODUCTION_BRANCH: ${{ inputs.production-branch }}
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
@@ -331,8 +335,12 @@ jobs:
 
           for ATTEMPT in $(seq 1 60); do
             PENDING_NAME=""
-            OWNER=""
+            SEEN=""
             FAILED_NAME=""
+            OWNER=""
+            OWNER_ID=""
+            OWNER_ATTEMPT=""
+            OWNER_FINISHED=""
 
             for NAME in "${NAMES[@]}"; do
               RUNS=$(runs_for "$NAME")
@@ -343,9 +351,7 @@ jobs:
                 continue
               fi
 
-              if [ -z "$OWNER" ]; then
-                OWNER="$NAME"
-              fi
+              SEEN="$NAME"
 
               UNFINISHED=$(echo "$RUNS" | jq '[.[] | select(.status != "completed")] | length')
               if [ "$UNFINISHED" -gt 0 ]; then
@@ -357,6 +363,15 @@ jobs:
               if [ "$SUCCEEDED" -eq 0 ]; then
                 FAILED_NAME="$NAME"
                 break
+              fi
+
+              LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.conclusion == "success")] | sort_by(.updated_at, .id) | last')
+              FINISHED=$(echo "$LATEST" | jq -r '.updated_at')
+              if [ -z "$OWNER" ] || [[ "$FINISHED" > "$OWNER_FINISHED" ]]; then
+                OWNER="$NAME"
+                OWNER_ID=$(echo "$LATEST" | jq -r '.id')
+                OWNER_ATTEMPT=$(echo "$LATEST" | jq -r '.run_attempt')
+                OWNER_FINISHED="$FINISHED"
               fi
             done
 
@@ -372,17 +387,18 @@ jobs:
               continue
             fi
 
-            if [ -z "$OWNER" ]; then
+            if [ -z "$SEEN" ]; then
               echo "No listed deploy workflow has a run on ${SHA}; this run owns the suite."
               emit true "$SHA" "$ENVIRONMENT"
               exit 0
             fi
 
-            if [ "$THIS_WORKFLOW" = "$OWNER" ]; then
-              echo "Every deploy on ${SHA} is green and ${OWNER} owns the suite, which is this run."
+            echo "Every deploy on ${SHA} is green. ${OWNER} run ${OWNER_ID} attempt ${OWNER_ATTEMPT} turned green last, at ${OWNER_FINISHED}, so it owns the suite."
+            if [ "$THIS_RUN_ID" = "$OWNER_ID" ] && [ "$THIS_RUN_ATTEMPT" = "$OWNER_ATTEMPT" ]; then
+              echo "This run was triggered by ${THIS_WORKFLOW} run ${THIS_RUN_ID} attempt ${THIS_RUN_ATTEMPT}, which is the owner."
               emit true "$SHA" "$ENVIRONMENT"
             else
-              echo "Every deploy on ${SHA} is green and ${OWNER} owns the suite, so this run yields."
+              echo "This run was triggered by ${THIS_WORKFLOW} run ${THIS_RUN_ID} attempt ${THIS_RUN_ATTEMPT}, so it yields."
               emit false "$SHA" "$ENVIRONMENT"
             fi
             exit 0
