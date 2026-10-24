@@ -47,6 +47,13 @@ inputs:
       role-to-assume and ecr-registries hold.
     required: false
     default: "false"
+  ecr-public-login:
+    description: >-
+      `true` logs in to public.ecr.aws with the assumed role before the pull, so an ECR
+      Public base image pulls with an authenticated quota instead of the shared anonymous
+      one. Skipped with skip-login, which leaves every login to the caller.
+    required: false
+    default: "false"
 
 outputs:
   enabled:
@@ -113,6 +120,14 @@ runs:
       uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
       with:
         registries: ${{ steps.registries.outputs.registries }}
+
+    - name: Log in to Amazon ECR Public
+      if: inputs.skip-login != 'true' && inputs.ecr-public-login == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        aws ecr-public get-login-password --region us-east-1 \
+          | docker login --username AWS --password-stdin public.ecr.aws
 
     - name: Resolve the base image from the Dockerfile
       id: base

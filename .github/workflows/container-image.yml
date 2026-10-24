@@ -62,6 +62,14 @@ on:
         type: string
         required: false
         default: ""
+      ecr-public-login:
+        description: >-
+          Log in to public.ecr.aws with the assumed role before the build, so a FROM on an
+          ECR Public image pulls with an authenticated quota instead of the shared anonymous
+          one. The role needs ecr-public:GetAuthorizationToken and sts:GetServiceBearerToken.
+        type: boolean
+        required: false
+        default: false
       image-tag-suffix:
         description: >-
           Optional suffix appended to the computed tag, giving sha-<full git sha>-<suffix>.
@@ -208,6 +216,13 @@ jobs:
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
         with:
           registries: ${{ steps.registries.outputs.registries }}
+
+      - name: Log in to Amazon ECR Public
+        if: inputs.ecr-public-login
+        run: |
+          set -euo pipefail
+          aws ecr-public get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin public.ecr.aws
 
       - name: Compute the immutable tag
         id: tag

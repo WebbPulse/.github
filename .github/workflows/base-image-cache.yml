@@ -31,6 +31,14 @@ on:
         type: string
         required: false
         default: ""
+      ecr-public-login:
+        description: >-
+          Log in to public.ecr.aws with the assumed role before the pull, so an ECR Public
+          base image pulls with an authenticated quota instead of the shared anonymous one.
+          The role needs ecr-public:GetAuthorizationToken and sts:GetServiceBearerToken.
+        type: boolean
+        required: false
+        default: false
       environment:
         description: >-
           GitHub Environment to bind the job to. A caller using a reusable workflow cannot
@@ -93,6 +101,7 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           role-to-assume: ${{ secrets.role-to-assume }}
           ecr-registries: ${{ inputs.additional-ecr-registries }}
+          ecr-public-login: ${{ inputs.ecr-public-login }}
 
       - name: Write the warm up result to the summary
         env:
