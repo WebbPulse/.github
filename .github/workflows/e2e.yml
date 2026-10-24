@@ -191,6 +191,29 @@ on:
         type: string
         required: false
         default: "ubuntu-latest"
+      terraform-workspaces:
+        description: >-
+          Comma separated WebbPulse Terraform plane workspace names whose runs on the deployed
+          commit must finish before the suite starts, for example "CarModPicker-staging". The
+          wait reads the `webbpulse-terraform/<workspace>` check runs the plane publishes on
+          the commit, so it needs no plane credential. Empty skips the wait.
+        type: string
+        required: false
+        default: ""
+      terraform-settle-seconds:
+        description: >-
+          Seconds that must pass after the newest of those runs finished before the suite
+          starts, so IAM and other eventually consistent changes the apply made can propagate.
+        type: number
+        required: false
+        default: 60
+      terraform-timeout-minutes:
+        description: >-
+          Minutes the Terraform wait may take before it fails the job, naming the workspace
+          it was still waiting on.
+        type: number
+        required: false
+        default: 20
     secrets:
       role-to-assume:
         description: >-
@@ -408,6 +431,116 @@ jobs:
       MODE: ${{ needs.gate.outputs.read-only == 'true' && 'read-only' || 'full' }}
       JUNIT_PATH: ${{ inputs.working-directory }}/e2e-results.xml
     steps:
+      - name: Wait for the Terraform runs on the deployed commit
+        id: terraform
+        if: inputs.terraform-workspaces != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          WORKSPACES: ${{ inputs.terraform-workspaces }}
+          SETTLE_SECONDS: ${{ inputs.terraform-settle-seconds }}
+          TIMEOUT_MINUTES: ${{ inputs.terraform-timeout-minutes }}
+          PLANE_CHECK: webbpulse-terraform
+          POLL_SECONDS: "20"
+        run: |
+          set -euo pipefail
+
+          for VALUE in "$SETTLE_SECONDS" "$TIMEOUT_MINUTES"; do
+            if ! [[ "$VALUE" =~ ^[0-9]+$ ]]; then
+              echo "::error::terraform-settle-seconds and terraform-timeout-minutes must be whole numbers, got '${VALUE}'."
+              exit 1
+            fi
+          done
+
+          mapfile -t NAMES < <(echo "$WORKSPACES" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true)
+          if [ "${#NAMES[@]}" -eq 0 ]; then
+            echo "terraform-workspaces names no workspace, so there is nothing to wait for."
+            exit 0
+          fi
+
+          newest_check() {
+            local ENCODED
+            ENCODED=$(jq -rn --arg value "$1" '$value | @uri')
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/check-runs?check_name=${ENCODED}&filter=all&per_page=100" \
+              --jq "[.check_runs[] | select(.app.slug == \"${PLANE_CHECK}\")] | sort_by(.started_at, .id) | last // empty | {status, conclusion, completed_at, title: (.output.title // \"\")}"
+          }
+
+          echo "Waiting for runs on ${NAMES[*]} at ${TARGET_SHA}, for up to ${TIMEOUT_MINUTES} minutes."
+          DEADLINE=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          LAST_WAITING=""
+
+          while :; do
+            WAITING=""
+            LATEST_DONE=0
+            REPORT=()
+
+            if ! AGGREGATE=$(newest_check "$PLANE_CHECK"); then
+              WAITING="the GitHub API, which refused the ${PLANE_CHECK} check run read"
+            elif [ -z "$AGGREGATE" ]; then
+              WAITING="the plane to report on this commit: there is no ${PLANE_CHECK} check run on it yet"
+            else
+              for NAME in "${NAMES[@]}"; do
+                if ! STATE=$(newest_check "${PLANE_CHECK}/${NAME}"); then
+                  WAITING="the GitHub API, which refused the ${PLANE_CHECK}/${NAME} check run read"
+                  break
+                fi
+                if [ -z "$STATE" ]; then
+                  REPORT+=("${NAME}: no run on this commit.")
+                  continue
+                fi
+                STATUS=$(jq -r '.status' <<<"$STATE")
+                CONCLUSION=$(jq -r '.conclusion // ""' <<<"$STATE")
+                TITLE=$(jq -r '.title' <<<"$STATE")
+                if [ "$STATUS" != "completed" ]; then
+                  WAITING="${NAME}, whose run is ${STATUS} (${TITLE})"
+                  break
+                fi
+                if [ "$CONCLUSION" = "action_required" ]; then
+                  WAITING="${NAME}, whose run is held for confirmation (${TITLE}); confirm or discard it on the plane"
+                  break
+                fi
+                DONE=$(date -d "$(jq -r '.completed_at' <<<"$STATE")" +%s)
+                if [ "$DONE" -gt "$LATEST_DONE" ]; then
+                  LATEST_DONE=$DONE
+                fi
+                REPORT+=("${NAME}: ${CONCLUSION} (${TITLE}).")
+                if [ "$CONCLUSION" != "success" ] && [ "$CONCLUSION" != "neutral" ]; then
+                  echo "::warning::The run on ${NAME} ended ${CONCLUSION} (${TITLE}), so the suite runs against whatever it left in place."
+                fi
+              done
+            fi
+
+            if [ -z "$WAITING" ]; then
+              break
+            fi
+
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Waited ${TIMEOUT_MINUTES} minutes for the Terraform runs on ${TARGET_SHA} and was still waiting on ${WAITING}. The suite did not start. Finish or discard that run, then re-run this job."
+              exit 1
+            fi
+
+            if [ "$WAITING" != "$LAST_WAITING" ]; then
+              echo "Waiting on ${WAITING}."
+              LAST_WAITING="$WAITING"
+            fi
+            sleep "$POLL_SECONDS"
+          done
+
+          printf '%s\n' "${REPORT[@]}"
+
+          if [ "$LATEST_DONE" -eq 0 ]; then
+            echo "No named workspace ran on this commit, so no settle window applies."
+            exit 0
+          fi
+
+          REMAINING=$(( SETTLE_SECONDS - ($(date +%s) - LATEST_DONE) ))
+          if [ "$REMAINING" -gt 0 ]; then
+            echo "The newest run finished $(( SETTLE_SECONDS - REMAINING )) seconds ago; settling for ${REMAINING} more seconds."
+            sleep "$REMAINING"
+          else
+            echo "The newest run finished over ${SETTLE_SECONDS} seconds ago, so the settle window has already passed."
+          fi
+
       - name: Forward the Environment's E2E_ variables
         env:
           VARS_JSON: ${{ toJSON(vars) }}
@@ -569,6 +702,7 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           SUITE_OUTCOME: ${{ steps.suite.outcome }}
+          TERRAFORM_OUTCOME: ${{ steps.terraform.outcome }}
           JOB_STATUS: ${{ job.status }}
         with:
           script: |
@@ -641,6 +775,11 @@ jobs:
             lines.push("");
             if (mode === "read-only") {
               lines.push("A read-only run is anonymous: no sign in, no mutations, and every signed-in test is skipped.");
+              lines.push("");
+            }
+
+            if (process.env.TERRAFORM_OUTCOME === "failure") {
+              lines.push("The Terraform wait failed, so the suite never started. The job log names the workspace run it was still waiting on.");
               lines.push("");
             }
 
