@@ -1270,6 +1270,9 @@ fails on a red suite, so the deploy workflow goes red and GitHub notifies.
 | `codeartifact-domain` | string | `""` | Empty skips the CodeArtifact auth step. |
 | `codeartifact-index` | string | `codeartifact` | |
 | `runs-on` | string | `ubuntu-latest` | |
+| `terraform-workspaces` | string | `""` | Comma separated plane workspace names whose runs on the deployed commit must finish first. Empty skips the wait. See [Waiting on Terraform runs](#waiting-on-terraform-runs). |
+| `terraform-settle-seconds` | number | `60` | Seconds after the newest of those runs finished before the suite starts. |
+| `terraform-timeout-minutes` | number | `20` | Minutes the wait may take before it fails the job. |
 
 | Secret | Required | Notes |
 | --- | --- | --- |
@@ -1365,6 +1368,47 @@ environment it targets.
 - Ownership is deterministic: the **first** name in `deploy-workflows` order that has a run on
   the commit owns the suite. Every other triggering workflow yields, so two green deploys on
   one commit produce exactly one suite run rather than two.
+
+### Waiting on Terraform runs
+
+A deploy and the Terraform apply for the same merge start together, so the suite can race
+the apply, or IAM changes the apply made that are still propagating. A caller whose deploy
+pairs with plane workspaces names them in `terraform-workspaces`, and the first step of the
+suite job then waits for them. Leaving the input empty skips the step, so callers that do
+not pass it behave as before.
+
+The wait needs no plane credential. The WebbPulse Terraform plane reports every VCS run back
+to GitHub through its App: a `webbpulse-terraform/<workspace>` check run on the commit the
+run is for, and a `webbpulse-terraform` aggregate on every push it ingests. The step reads
+those check runs on the deployed commit with the job's own `github.token`, which the
+`checks: write` the caller already grants covers, so nothing long lived is minted or stored.
+
+- Until the aggregate exists the plane has not picked the push up yet, so the step waits.
+- For each named workspace it takes the newest check run of that name from the plane's App.
+  A held run completes as `action_required`, and once it is confirmed a newer check run of
+  the same name carries the apply, so only the newest one counts.
+- A workspace with no check run on the commit did not run for it and is skipped.
+- A run that is queued, planning, applying or auto-applying is waited for. A run held for
+  confirmation is waited for too, since its apply has not happened: confirm or discard it
+  with `wp-tf` and the wait moves on.
+- A run that finished counts as done whatever its conclusion. A failed or cancelled run
+  adds a warning, and the suite still runs.
+- Once nothing is active the step waits until `terraform-settle-seconds` have passed since
+  the newest finished run, which is usually less than the full window by the time the deploy
+  is done.
+- The check runs are polled every 20 seconds. If something is still active after
+  `terraform-timeout-minutes`, the job fails with an error naming the workspace and the run
+  state it was waiting on, and the published `e2e (<environment>)` check says the suite
+  never started.
+
+Name the workspaces for the environment the run targets. A caller with one job per
+environment passes a literal on each, and a caller with a single job picks by branch:
+
+```yaml
+      terraform-workspaces: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'main' && 'Example' || 'Example-staging' }}
+```
+
+Workspace names are case sensitive, as they are in `wp-tf -w`.
 
 ### Environment variables
 
