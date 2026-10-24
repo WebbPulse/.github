@@ -1516,6 +1516,10 @@ is deployed.
 The stack is three processes and no AWS runtime calls:
 
 - **DynamoDB Local** as a service container, published on `dynamodb-port` (8001 by default).
+- **floci**, only when `floci-image` is set, started with `docker run -d` on 127.0.0.1 at
+  `floci-port` (4566 by default) for AWS services DynamoDB Local does not cover, such as S3 and
+  SES. A wait step polls `/_floci/health` for up to 60 seconds. Without `floci-image` neither
+  step runs and the stack is the three processes below.
 - **The backend**, started from source by `backend-start-command`, which defaults to
   `uv run uvicorn app.composition.app:app --host 127.0.0.1 --port 8000`. That is the composed
   app carrying every domain on one port, which is contract equivalent to the deployed fan out
@@ -1526,7 +1530,8 @@ The stack is three processes and no AWS runtime calls:
 The only AWS the job touches is the existing OIDC plus CodeArtifact token exchange during the
 dependency install, because the shared `webbpulse` package and the `@webbpulse/*` npm scope
 have no public mirror. Everything else is local: no Secrets Manager, no KMS, no SES, no S3, no
-gateway, no SSM, no X-Ray.
+gateway, no SSM, no X-Ray. With floci on, S3, SES and the other services it emulates are
+served on the runner with dummy credentials, and still reach no AWS endpoint.
 
 **What runs locally, and what stays post deploy.** The local run carries **Reachability**,
 **Identity** minus minting, **Frontend** and **Browser**. **Route cut** is skipped, since
@@ -1592,6 +1597,9 @@ commit nobody is looking at.
 | `table-bootstrap-command` | string | `""` | For example `uv run python scripts/create_dynamo_tables.py`. Empty skips the step. |
 | `dynamodb-image` | string | `amazon/dynamodb-local:latest` | The image's default command is already `-inMemory -sharedDb`. |
 | `dynamodb-port` | number | `8001` | Host port. `backend-env-json` must point at it. |
+| `floci-image` | string | `""` | Empty skips floci. Pin an exact release tag such as `floci/floci:2.2.0`; a missing tag and `latest` or `nightly` tags are refused. Point the backend at it through `backend-env-json`, for example `AWS_ENDPOINT_URL_S3=http://127.0.0.1:4566`. |
+| `floci-port` | number | `4566` | Host port on 127.0.0.1. `FLOCI_BASE_URL` is set to match, so presigned URLs point at it. |
+| `floci-services` | string | `{}` | JSON object of `FLOCI_SERVICES_*` variables passed to the container, for example `{"FLOCI_SERVICES_SQS_ENABLED": "false"}`. Other keys are refused. |
 | `browser` | string | `chromium` | |
 | `headless` | boolean | `true` | |
 | `check-name` | string | `e2e (local)` | |
