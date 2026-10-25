@@ -835,7 +835,7 @@ jobs:
         env:
           FUNCTION_IMAGE_MAP: ${{ needs.image-map.outputs.function-image-map }}
           BOOTSTRAP_NOTE: ${{ inputs.bootstrap-note }}
-          PLANE_WORKSPACE: ${{ inputs.plane-check-name != '' && (needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production || inputs.plane-workspace-staging) || '' }}
+          PLANE_WORKSPACE: ${{ inputs.plane-check-name != '' && ((needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production) || (needs.resolve-env.outputs.name != inputs.production-environment && inputs.plane-workspace-staging) || '') || '' }}
         run: |
           set -euo pipefail
 
@@ -1058,7 +1058,7 @@ jobs:
     if: >-
       always()
       && inputs.plane-check-name != ''
-      && (needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production || inputs.plane-workspace-staging) != ''
+      && ((needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production) || (needs.resolve-env.outputs.name != inputs.production-environment && inputs.plane-workspace-staging) || '') != ''
       && needs.existing-functions.result == 'success'
       && needs.existing-functions.outputs.missing-function-image-map != ''
       && needs.existing-functions.outputs.missing-function-image-map != '{}'
@@ -1074,11 +1074,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           PLANE_CHECK: ${{ inputs.plane-check-name }}
-          WORKSPACE: ${{ needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production || inputs.plane-workspace-staging }}
-          TIMEOUT_MINUTES: ${{ needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-wait-minutes-production || inputs.plane-wait-minutes-staging }}
+          WORKSPACE: ${{ (needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production) || (needs.resolve-env.outputs.name != inputs.production-environment && inputs.plane-workspace-staging) || '' }}
+          IS_PRODUCTION: ${{ needs.resolve-env.outputs.name == inputs.production-environment }}
+          WAIT_MINUTES_PRODUCTION: ${{ inputs.plane-wait-minutes-production }}
+          WAIT_MINUTES_STAGING: ${{ inputs.plane-wait-minutes-staging }}
           POLL_SECONDS: ${{ inputs.plane-poll-seconds }}
         run: |
           set -euo pipefail
+
+          if [ "$IS_PRODUCTION" = "true" ]; then
+            TIMEOUT_MINUTES="$WAIT_MINUTES_PRODUCTION"
+          else
+            TIMEOUT_MINUTES="$WAIT_MINUTES_STAGING"
+          fi
+          if [ -z "$WORKSPACE" ]; then
+            echo "::error::No plane workspace is set for this environment."
+            exit 1
+          fi
 
           for VALUE in "$TIMEOUT_MINUTES" "$POLL_SECONDS"; do
             if ! [[ "$VALUE" =~ ^[0-9]+$ ]]; then
