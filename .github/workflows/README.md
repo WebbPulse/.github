@@ -734,7 +734,8 @@ onto one Lambda function per domain**. It is the eight job pipeline three produc
 each carrying a private copy of, hoisted verbatim: resolve the environment, work out the
 affected domains, warm the base image cache, build the images, assemble the function image
 map, drop the functions that do not exist yet, point each function at its new image, and
-smoke test each one.
+smoke test each one. Two opt in jobs then deploy the functions the plane apply on the same
+commit created; see [Functions the plane apply creates](#functions-the-plane-apply-creates).
 
 **AWS calls retry adaptively.** The workflow sets `AWS_RETRY_MODE=adaptive` and `AWS_MAX_ATTEMPTS=10`, so Lambda control plane throttling (`TooManyRequestsException`) backs off client side instead of failing the job after the CLI default of 2 retries.
 
@@ -874,6 +875,57 @@ unresolvable base both yield every domain.
 `deploy-workflow-file` defaults to the caller's own file name, derived from
 `github.workflow_ref`, so a caller does not name itself.
 
+### Functions the plane apply creates
+
+A function that does not exist yet is dropped from the deploy by `existing-functions` and
+reported in the `missing-function-image-map` output. On its own that is the whole story,
+which suits a product that only ever creates functions ahead of the code.
+
+A product whose plane apply on the same commit creates a new domain or consumer function
+has a gap: the apply seeds the function from the newest image in its repository, which can
+predate the commit, and the function stays on that seed image until the next deploy. Set
+`plane-check-name` and a workspace per environment to close it:
+
+```yaml
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/lambda-domains-deploy.yml@v3
+    with:
+      plane-check-name: webbpulse-terraform
+      plane-workspace-production: Standupless
+      plane-workspace-staging: Standupless-staging
+```
+
+The `new-functions` job then runs after the main deploy whenever a function was missing.
+It reads the newest `<plane-check-name>` check run on `GITHUB_SHA`, published by the GitHub
+App whose slug is also `<plane-check-name>`, and then the newest
+`<plane-check-name>/<workspace>` one:
+
+- No aggregate check run yet means the plane has not reported, so it keeps waiting.
+- An aggregate but no workspace check run means the workspace did not run on this commit,
+  so it stops waiting and creates nothing.
+- An unfinished run, and a run that concluded `action_required` (held for confirmation),
+  both count as still waiting. Any other conclusion ends the wait, failed applies included.
+
+It then probes the missing functions again and `deploy-new-functions` points the ones that
+now exist at this commit's image through `lambda-image-deploy.yml`, with the same
+`publish-version` and concurrency group as the main deploy. That map is the
+`created-function-image-map` output. A wait that outlasts
+`plane-wait-minutes-production` or `plane-wait-minutes-staging` fails the job; re-run it
+once the plane run finishes. Created functions are not smoke tested.
+
+**`checks: read` is only needed when `plane-check-name` is set.** The job declares no
+`permissions:` and inherits the caller's grant, and the workflow has no workflow level
+permissions block for that reason. Declaring `checks: read` on the job would fail every
+caller that does not grant it, because GitHub validates a nested job's permissions even
+when the job is skipped. Every other job declares its own.
+
+An empty `plane-check-name`, the default, and an empty workspace for the resolved
+environment both skip the wait, so a caller that sets neither behaves as before.
+
 ### Inputs
 
 | Input | Type | Default | Notes |
@@ -913,6 +965,12 @@ unresolvable base both yield every domain.
 | `smoke-user-agent` | string | `""` | Empty derives `<repository>-deploy-smoke`. |
 | `bootstrap-note` | string | see below | Summary line shown when no function exists yet. |
 | `concurrency-group` | string | `""` | For the deploy job. Empty derives one from the environment. |
+| `plane-check-name` | string | `""` | Plane check run name and App slug, for example `webbpulse-terraform`. Empty disables the wait. See [Functions the plane apply creates](#functions-the-plane-apply-creates). |
+| `plane-workspace-production` | string | `""` | Workspace waited on for production-environment. Empty skips the wait there. |
+| `plane-workspace-staging` | string | `""` | Workspace waited on for staging-environment. Empty skips the wait there. |
+| `plane-wait-minutes-production` | number | `45` | Minutes the wait may take on production before failing. |
+| `plane-wait-minutes-staging` | number | `20` | Minutes the wait may take on staging before failing. |
+| `plane-poll-seconds` | number | `20` | Seconds between check run reads. |
 | `runs-on` | string | `ubuntu-latest` | Runner label. |
 
 `bootstrap-note` defaults to "The first apply that creates the functions is what the next
@@ -931,6 +989,8 @@ run deploys to."
 | `dependency-stamp` | The value stamped into `DEPENDENCY_RESOLUTION`. |
 | `function-image-map` | Every function to its digest pinned image URI, before the existence filter. |
 | `deployed-function-image-map` | The same map filtered to the functions that exist, which is what was deployed. |
+| `missing-function-image-map` | The functions that did not exist when the deploy started. Empty when the existence filter did not run. |
+| `created-function-image-map` | The missing functions the plane apply created and that were then deployed. Empty when the wait did not run. |
 
 ### What the caller must grant
 
@@ -940,6 +1000,9 @@ permissions:
   contents: read
   actions: read
 ```
+
+A caller that sets `plane-check-name` also grants `checks: read`; see
+[Functions the plane apply creates](#functions-the-plane-apply-creates).
 
 `actions: read` is what lets the base commit resolution poll previous runs of the
 workflow. `id-token: write` is required because a called workflow can never hold a

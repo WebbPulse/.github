@@ -214,6 +214,45 @@ on:
         type: string
         required: false
         default: ""
+      plane-check-name:
+        description: >-
+          Check run name the WebbPulse Terraform plane publishes on each commit, for example
+          `webbpulse-terraform`. When set, a function that does not exist yet is not just
+          skipped: a job waits for the plane run on this commit, then deploys this commit's
+          image to whichever of those functions the apply created. Empty disables the wait,
+          so a missing function is only skipped. The wait job needs `checks: read`.
+        type: string
+        required: false
+        default: ""
+      plane-workspace-production:
+        description: >-
+          Plane workspace whose `<plane-check-name>/<workspace>` check run is waited on when
+          the run resolves to production-environment. Empty skips the wait there.
+        type: string
+        required: false
+        default: ""
+      plane-workspace-staging:
+        description: >-
+          Plane workspace waited on when the run resolves to staging-environment. Empty skips
+          the wait there.
+        type: string
+        required: false
+        default: ""
+      plane-wait-minutes-production:
+        description: "Minutes the plane wait may take on production before it fails the job."
+        type: number
+        required: false
+        default: 45
+      plane-wait-minutes-staging:
+        description: "Minutes the plane wait may take on staging before it fails the job."
+        type: number
+        required: false
+        default: 20
+      plane-poll-seconds:
+        description: "Seconds between check run reads while waiting on the plane."
+        type: number
+        required: false
+        default: 20
       runs-on:
         description: "Runner label."
         type: string
@@ -248,8 +287,21 @@ on:
       deployed-function-image-map:
         description: "The same map filtered to the functions that already exist, which is what was deployed."
         value: ${{ jobs.existing-functions.outputs.function-image-map }}
+      missing-function-image-map:
+        description: >-
+          The same map filtered to the functions that did not exist when the deploy started.
+          Empty when the existence filter did not run.
+        value: ${{ jobs.existing-functions.outputs.missing-function-image-map }}
+      created-function-image-map:
+        description: >-
+          The functions from missing-function-image-map that the plane apply on this commit
+          created and that were then deployed. Empty when the plane wait did not run.
+        value: ${{ jobs.new-functions.outputs.function-image-map }}
 
-permissions: {}
+# No workflow level permissions block: every job but new-functions declares its own, and
+# new-functions inherits whatever the caller grants, so `checks: read` is only needed by a
+# caller that sets plane-check-name. A declared `checks: read` would fail every caller that
+# does not grant it, even with the job skipped.
 
 env:
   AWS_RETRY_MODE: adaptive
@@ -770,6 +822,7 @@ jobs:
       id-token: write
     outputs:
       function-image-map: ${{ steps.filter.outputs.function-image-map }}
+      missing-function-image-map: ${{ steps.filter.outputs.missing-function-image-map }}
     steps:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
@@ -782,6 +835,7 @@ jobs:
         env:
           FUNCTION_IMAGE_MAP: ${{ needs.image-map.outputs.function-image-map }}
           BOOTSTRAP_NOTE: ${{ inputs.bootstrap-note }}
+          PLANE_WORKSPACE: ${{ inputs.plane-check-name != '' && (needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production || inputs.plane-workspace-staging) || '' }}
         run: |
           set -euo pipefail
 
@@ -823,10 +877,13 @@ jobs:
           full = json.load(sys.stdin)
           present = {n for n in os.environ["PRESENT"].split("\n") if n}
           json.dump({k: v for k, v in full.items() if k in present}, open("deploy-map.json", "w"), indent=2)
+          json.dump({k: v for k, v in full.items() if k not in present}, open("missing-map.json", "w"), indent=2)
           '
 
           MAP=$(python3 -c 'import json; print(json.dumps(json.load(open("deploy-map.json"))))')
           echo "function-image-map=${MAP}" >> "$GITHUB_OUTPUT"
+          MISSING_MAP=$(python3 -c 'import json; print(json.dumps(json.load(open("missing-map.json"))))')
+          echo "missing-function-image-map=${MISSING_MAP}" >> "$GITHUB_OUTPUT"
 
           # shellcheck disable=SC2016 # the $/ in the sed scripts below is an end anchor,
           # not a shell expansion, so the single quotes are deliberate.
@@ -843,7 +900,12 @@ jobs:
             fi
             if [ -n "$MISSING" ]; then
               echo
-              echo "Not created yet, skipped:"
+              if [ -n "$PLANE_WORKSPACE" ]; then
+                echo "Not created yet, so the new-functions job waits for the ${PLANE_WORKSPACE}"
+                echo "plane run on this commit and deploys whichever of these it created:"
+              else
+                echo "Not created yet, skipped:"
+              fi
               echo
               printf "%b" "$MISSING" | sed 's/^/- `/; s/$/`/'
             fi
@@ -983,3 +1045,176 @@ jobs:
           if [ -n "$SMOKE_EXCLUDE_SUFFIX" ]; then
             echo "Functions ending ${SMOKE_EXCLUDE_SUFFIX} are excluded: no API Gateway route to probe."
           fi
+
+  # The plane apply on this commit creates a new domain or consumer function seeded from the
+  # newest image in its repository, which can predate this commit. Without this job such a
+  # function stays on that seed image until the next deploy. The job waits for the plane's
+  # check run for the environment's workspace, treating a run held for confirmation as still
+  # running and stopping early when the workspace did not run on this commit, then re-probes
+  # the missing functions and hands the ones that now exist to deploy-new-functions.
+  new-functions:
+    name: Wait for the plane to create the missing functions
+    needs: [resolve-env, existing-functions, deploy-images]
+    if: >-
+      always()
+      && inputs.plane-check-name != ''
+      && (needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production || inputs.plane-workspace-staging) != ''
+      && needs.existing-functions.result == 'success'
+      && needs.existing-functions.outputs.missing-function-image-map != ''
+      && needs.existing-functions.outputs.missing-function-image-map != '{}'
+      && needs.deploy-images.result != 'failure'
+      && needs.deploy-images.result != 'cancelled'
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ needs.resolve-env.outputs.name }}
+    outputs:
+      function-image-map: ${{ steps.filter.outputs.function-image-map }}
+    steps:
+      - name: Wait for the plane run on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PLANE_CHECK: ${{ inputs.plane-check-name }}
+          WORKSPACE: ${{ needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-workspace-production || inputs.plane-workspace-staging }}
+          TIMEOUT_MINUTES: ${{ needs.resolve-env.outputs.name == inputs.production-environment && inputs.plane-wait-minutes-production || inputs.plane-wait-minutes-staging }}
+          POLL_SECONDS: ${{ inputs.plane-poll-seconds }}
+        run: |
+          set -euo pipefail
+
+          for VALUE in "$TIMEOUT_MINUTES" "$POLL_SECONDS"; do
+            if ! [[ "$VALUE" =~ ^[0-9]+$ ]]; then
+              echo "::error::plane-wait-minutes-production, plane-wait-minutes-staging and plane-poll-seconds must be whole numbers, got '${VALUE}'."
+              exit 1
+            fi
+          done
+
+          newest_check() {
+            local ENCODED
+            ENCODED=$(jq -rn --arg value "$1" '$value | @uri')
+            gh api "repos/${REPOSITORY}/commits/${GITHUB_SHA}/check-runs?check_name=${ENCODED}&filter=all&per_page=100" \
+              --jq "[.check_runs[] | select(.app.slug == \"${PLANE_CHECK}\")] | sort_by(.started_at, .id) | last // empty | {status, conclusion, title: (.output.title // \"\")}"
+          }
+
+          echo "Waiting up to ${TIMEOUT_MINUTES} minutes for the ${WORKSPACE} run at ${GITHUB_SHA}."
+          DEADLINE=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          LAST_WAITING=""
+
+          while :; do
+            WAITING=""
+            if ! AGGREGATE=$(newest_check "$PLANE_CHECK"); then
+              WAITING="the GitHub API, which refused the ${PLANE_CHECK} check run read; the caller must grant checks: read"
+            elif [ -z "$AGGREGATE" ]; then
+              WAITING="the plane to report on this commit"
+            elif ! STATE=$(newest_check "${PLANE_CHECK}/${WORKSPACE}"); then
+              WAITING="the GitHub API, which refused the ${PLANE_CHECK}/${WORKSPACE} check run read"
+            elif [ -z "$STATE" ]; then
+              echo "The plane did not run ${WORKSPACE} on this commit, so it creates no function."
+              break
+            else
+              STATUS=$(jq -r '.status' <<<"$STATE")
+              CONCLUSION=$(jq -r '.conclusion // ""' <<<"$STATE")
+              TITLE=$(jq -r '.title' <<<"$STATE")
+              if [ "$STATUS" != "completed" ]; then
+                WAITING="${WORKSPACE}, whose run is ${STATUS} (${TITLE})"
+              elif [ "$CONCLUSION" = "action_required" ]; then
+                WAITING="${WORKSPACE}, whose run is held for confirmation (${TITLE})"
+              else
+                echo "${WORKSPACE}: ${CONCLUSION} (${TITLE})."
+                break
+              fi
+            fi
+
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Waited ${TIMEOUT_MINUTES} minutes and was still waiting on ${WAITING}. Functions the apply creates later keep their seed image until this job is re-run."
+              exit 1
+            fi
+            if [ "$WAITING" != "$LAST_WAITING" ]; then
+              echo "Waiting on ${WAITING}."
+              LAST_WAITING="$WAITING"
+            fi
+            sleep "$POLL_SECONDS"
+          done
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Keep the functions the apply created
+        id: filter
+        env:
+          MISSING_FUNCTION_IMAGE_MAP: ${{ needs.existing-functions.outputs.missing-function-image-map }}
+        run: |
+          set -euo pipefail
+
+          printf '%s' "$MISSING_FUNCTION_IMAGE_MAP" > missing-map.json
+          FUNCTIONS=$(python3 -c 'import json; print("\n".join(sorted(json.load(open("missing-map.json")))))')
+
+          CREATED=""
+          while IFS= read -r FUNCTION; do
+            [ -n "$FUNCTION" ] || continue
+            set +e
+            ERR=$(aws lambda get-function-configuration \
+              --function-name "$FUNCTION" \
+              --query 'FunctionName' --output text 2>&1 >/dev/null)
+            STATUS=$?
+            set -e
+            if [ "$STATUS" -eq 0 ]; then
+              CREATED="${CREATED}${FUNCTION}\n"
+              continue
+            fi
+            case "$ERR" in
+              *ResourceNotFoundException*|*"Function not found"*)
+                echo "${FUNCTION} still does not exist, skipped."
+                ;;
+              *)
+                echo "$ERR"
+                echo "::error::get-function-configuration failed for ${FUNCTION} for a reason other than the function not existing."
+                exit 1
+                ;;
+            esac
+          done <<< "$FUNCTIONS"
+
+          MAP=$(CREATED="$(printf "%b" "$CREATED")" python3 -c '
+          import json, os
+
+          full = json.load(open("missing-map.json"))
+          created = {n for n in os.environ["CREATED"].split("\n") if n}
+          print(json.dumps({k: v for k, v in full.items() if k in created}))
+          ')
+          echo "function-image-map=${MAP}" >> "$GITHUB_OUTPUT"
+
+          # shellcheck disable=SC2016 # the $/ in the sed script below is an end anchor.
+          {
+            echo "## Functions created by the apply"
+            echo
+            if [ -n "$CREATED" ]; then
+              echo "Moving onto this commit's image:"
+              echo
+              printf "%b" "$CREATED" | sed 's/^/- `/; s/$/`/'
+            else
+              echo "The apply created none of the missing functions."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-new-functions:
+    name: Point each created function at its new image
+    needs: [resolve-env, new-functions]
+    if: >-
+      always()
+      && needs.new-functions.result == 'success'
+      && needs.new-functions.outputs.function-image-map != ''
+      && needs.new-functions.outputs.function-image-map != '{}'
+    permissions:
+      contents: read
+      id-token: write
+    uses: WebbPulse/.github/.github/workflows/lambda-image-deploy.yml@v3
+    with:
+      environment: ${{ needs.resolve-env.outputs.name }}
+      aws-region: ${{ inputs.aws-region }}
+      function-image-map: ${{ needs.new-functions.outputs.function-image-map }}
+      publish-version: ${{ inputs.publish-version }}
+      concurrency-group: ${{ inputs.concurrency-group != '' && inputs.concurrency-group || format('backend-image-deploy-{0}', needs.resolve-env.outputs.name) }}
+      runs-on: ${{ inputs.runs-on }}
+    secrets:
+      role-to-assume: ${{ needs.resolve-env.outputs.role-arn }}
